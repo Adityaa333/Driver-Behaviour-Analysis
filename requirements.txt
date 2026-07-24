@@ -1,0 +1,11 @@
+paho-mqtt
+numpy
+pandas
+scikit-learn
+joblib
+matplotlib
+seaborn
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv

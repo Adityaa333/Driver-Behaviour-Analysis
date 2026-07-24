@@ -1,0 +1,5 @@
+Datasets - 
+1. Driving Behavior - Main training - https://www.kaggle.com/datasets/outofskills/driving-behavior/
+2. Larger set - More Sample - https://www.kaggle.com/datasets/shakilofficial0/large-scale-driver-behavior-sensor-dataset/
+3. Harsh Driving - Harsh event recognition - https://www.kaggle.com/datasets/saboorahmad47/harsh-driving-dataset
+4. Phone Dataset - GPS and Speed validation - https://www.kaggle.com/datasets/shardulnazirkar1/phone-sensor-data-while-driving-a-car
