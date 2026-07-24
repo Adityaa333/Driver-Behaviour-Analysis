@@ -40,7 +40,9 @@ The Driver Behaviour Analysis System is an embedded IoT project designed to moni
 
 The system consists of an ESP32-based firmware that interfaces with vehicle sensors, processes driver behaviour locally, and publishes telemetry over MQTT. The published data can be visualized using a Node-RED dashboard for real-time monitoring.
 
----
+![System Architecture](docs/diagrams/System-Architecture.png)
+
+--
 
 ## Folder Structure
 
@@ -50,6 +52,8 @@ The system consists of an ESP32-based firmware that interfaces with vehicle sens
 - **dashboard/**: Node-RED flow configuration for real-time visualization.
 - **docs/**: Project documentation.
 
+![Module Dependancy](docs/diagrams/Module-dependancy.png)
+
 ---
 
 ## How It Works
@@ -58,6 +62,9 @@ The system consists of an ESP32-based firmware that interfaces with vehicle sens
 2. **Data Processing**: FreeRTOS tasks process sensor data to detect unsafe driving events and calculate a driver safety score.
 3. **Data Transmission**: Processed telemetry is published to an MQTT broker over Wi-Fi.
 4. **Visualization**: The Node-RED dashboard subscribes to MQTT topics and displays real-time telemetry and driver statistics.
+
+![Data Flow](docs/diagrams/Data-Flow.png)
+![Task Sequencing](docs/diagrams/Sequence.png)
 
 ---
 
