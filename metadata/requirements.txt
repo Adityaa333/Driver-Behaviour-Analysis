@@ -2,11 +2,13 @@ paho-mqtt
 numpy
 pandas
 scikit-learn
+xgboost
 joblib
 matplotlib
 seaborn
 fastapi
 uvicorn[standard]
 pydantic
+pydantic-settings
 python-dotenv
 sqlalchemy

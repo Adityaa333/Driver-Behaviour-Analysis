@@ -14,10 +14,16 @@ Responsibilities:
       Node-RED, load balancers, or container orchestrators).
     - Mount the REST API router defined in api.py.
 
-Design notes / assumptions (stated explicitly per project requirements,
-since database.py and mqtt_handler.py are not being generated in this
-exchange but app.py depends on them):
+FIX NOTE (see accompanying compatibility review): mqtt_topic_prefix
+previously defaulted to "fleet/telemetry", which doesn't match the
+firmware's actual topic layout of "fleet/{device_id}/<type>" (five
+different <type> suffixes, not one). It now defaults to "fleet", the
+fixed prefix segment, and MQTTIngestHandler builds the five wildcard
+subscriptions from it. mqtt_handler.py was also fixed to define the
+`MQTTIngestHandler` class with the `topic_prefix` constructor
+parameter and `is_connected()` method this file relies on.
 
+Design notes / assumptions:
     1. FastAPI was selected over Flask because:
          - Native async support is required so the synchronous MQTT
            client thread never blocks HTTP request handling.
@@ -26,37 +32,26 @@ exchange but app.py depends on them):
            writing to the API.
          - Automatic OpenAPI docs generation aids operational/fleet
            debugging.
-    2. database.py is assumed to expose the following interface:
+    2. database.py exposes:
            - init_db() -> None
-                 Creates tables if they do not already exist.
-           - get_session() -> contextlib.AbstractContextManager[Session]
-                 Context manager yielding a SQLAlchemy Session.
+           - get_session() -> Session
            - engine
-                 The SQLAlchemy Engine instance (used for health checks).
-       These names form a fixed contract; api.py and mqtt_handler.py
-       must conform to it.
-    3. mqtt_handler.py is assumed to expose:
+    3. mqtt_handler.py exposes:
            - class MQTTIngestHandler:
                  def __init__(self, broker_host: str, broker_port: int,
                               topic_prefix: str, client_id: str) -> None
                  def start(self) -> None    # non-blocking, spawns its own thread
                  def stop(self) -> None     # graceful disconnect, flushes QoS 1/2
                  def is_connected(self) -> bool
-       Running the MQTT client on its own dedicated thread (rather than
-       inside the asyncio event loop) avoids coupling the paho-mqtt
-       network loop to FastAPI's event loop, so a slow/unreachable
-       broker can never stall HTTP request handling.
     4. Configuration is sourced from environment variables via
        pydantic-settings, with defaults overridable by a local .env
-       file. config.py was not requested in this exchange, so Settings
-       are defined locally here; if a shared config.py is introduced
-       later, this class should move there unchanged.
+       file.
     5. CORS is enabled for all origins ONLY by default, because the
        Node-RED dashboard may be served from a different host/port on
        the fleet operator's internal network. This MUST be restricted
        to explicit origins (CORS_ORIGINS env var) before exposure
        beyond a trusted internal network.
-    6. api.py is assumed to expose `router: fastapi.APIRouter`.
+    6. api.py exposes `router: fastapi.APIRouter`.
 
 Run (development):
     uvicorn app:app --reload --host 0.0.0.0 --port 8000
@@ -64,10 +59,10 @@ Run (development):
 Run (production):
     uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1
     NOTE: If scaling beyond 1 worker process, only one process should
-    run the MQTT ingestion handler (e.g. via a dedicated ingestion
-    process/deployment) to avoid duplicate message processing; the
-    MQTT_CLIENT_ID_SUFFIX below exists to keep client IDs unique if
-    multiple ingestion-enabled workers are ever run intentionally.
+    run the MQTT ingestion handler to avoid duplicate message
+    processing; mqtt_client_id_suffix below exists to keep client IDs
+    unique if multiple ingestion-enabled workers are ever run
+    intentionally.
 """
 
 from __future__ import annotations
@@ -111,7 +106,10 @@ class Settings(BaseSettings):
 
     mqtt_broker_host: str = "localhost"
     mqtt_broker_port: int = 1883
-    mqtt_topic_prefix: str = "fleet/telemetry"
+    # Fixed prefix segment of every firmware topic: "fleet/{device_id}/<type>"
+    # (see MQTT_TOPIC_*_FMT in config.h). MQTTIngestHandler subscribes to
+    # "{mqtt_topic_prefix}/+/telemetry", ".../score", etc.
+    mqtt_topic_prefix: str = "fleet"
     # Distinguishes MQTT client IDs across processes/restarts so the
     # broker never rejects a duplicate persistent client ID.
     mqtt_client_id_suffix: str = uuid.uuid4().hex[:8]

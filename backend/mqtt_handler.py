@@ -10,12 +10,19 @@ signatures (paho-mqtt 2.0 changed on_connect/on_disconnect signatures
 and requires explicitly selecting a callback API version).
 
 Runs via client.loop_start(), which spawns its own background thread
-inside the paho-mqtt library - MQTTHandler.start()/stop() are called
-once each from app.py's FastAPI lifespan handler, not from a request
-handler.
+inside the paho-mqtt library - start()/stop() are called once each from
+app.py's FastAPI lifespan handler, not from a request handler.
+
+FIX NOTE (see accompanying compatibility review): app.py imports this
+class as `MQTTIngestHandler` and constructs it with
+`(broker_host, broker_port, topic_prefix, client_id)`. The previous
+version of this file defined `MQTTHandler` with a different constructor
+signature (no topic_prefix) and no `is_connected()` method that
+app.py's /health endpoint calls. Both are fixed below; topic_prefix
+also now actually drives the wildcard subscriptions instead of the
+literal string "fleet" being hardcoded.
 """
 
-import os
 import json
 import logging
 from typing import Optional
@@ -34,39 +41,47 @@ from database import (
 
 logger = logging.getLogger("dbas.mqtt_handler")
 
-# ---------------------------------------------------------------------------
-# Configuration (environment-overridable)
-# ---------------------------------------------------------------------------
 
-MQTT_BROKER_HOST = os.environ.get("MQTT_BROKER_HOST", "localhost")
-MQTT_BROKER_PORT = int(os.environ.get("MQTT_BROKER_PORT", "1883"))
-MQTT_CLIENT_ID = os.environ.get("MQTT_CLIENT_ID", "dbas_backend")
-MQTT_KEEPALIVE_SEC = int(os.environ.get("MQTT_KEEPALIVE_SEC", "60"))
-MQTT_USERNAME = os.environ.get("MQTT_USERNAME") or None
-MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD") or None
-
-# Wildcard subscriptions matching the firmware's topic format strings in
-# config.h (MQTT_TOPIC_*_FMT = "fleet/%s/<type>"). QoS chosen to match
-# (or exceed) the QoS the firmware publishes each message type at.
-_SUBSCRIPTIONS = [
-    ("fleet/+/telemetry", 1),
-    ("fleet/+/score", 1),
-    ("fleet/+/alert", 2),
-    ("fleet/+/crash", 2),
-    ("fleet/+/status", 1),
-]
+# Message types published under fleet/{device_id}/<type> by the
+# firmware (see config.h's MQTT_TOPIC_*_FMT macros), with the QoS to
+# subscribe at (chosen to match, or exceed, the QoS the firmware
+# publishes each message type at).
+_MESSAGE_TYPE_QOS = {
+    "telemetry": 1,
+    "score": 1,
+    "alert": 2,
+    "crash": 2,
+    "status": 1,
+}
 
 
-class MQTTHandler:
+class MQTTIngestHandler:
     """Encapsulates the paho-mqtt client's lifecycle and message
     dispatch. One instance is created and owned by app.py."""
 
-    def __init__(self, broker_host: str = MQTT_BROKER_HOST, broker_port: int = MQTT_BROKER_PORT,
-                 client_id: str = MQTT_CLIENT_ID, keepalive_sec: int = MQTT_KEEPALIVE_SEC,
-                 username: Optional[str] = MQTT_USERNAME, password: Optional[str] = MQTT_PASSWORD):
+    def __init__(
+        self,
+        broker_host: str,
+        broker_port: int,
+        topic_prefix: str = "fleet",
+        client_id: str = "dbas_backend",
+        keepalive_sec: int = 60,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+    ):
         self._broker_host = broker_host
         self._broker_port = broker_port
         self._keepalive_sec = keepalive_sec
+
+        # topic_prefix is the fixed segment the firmware always
+        # publishes under (see MQTT_TOPIC_*_FMT = "fleet/%s/<type>" in
+        # config.h) - NOT the device id, which sits in the middle
+        # wildcard position.
+        self._topic_prefix = topic_prefix.strip("/") or "fleet"
+        self._subscriptions = [
+            (f"{self._topic_prefix}/+/{msg_type}", qos)
+            for msg_type, qos in _MESSAGE_TYPE_QOS.items()
+        ]
 
         self._client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
@@ -97,6 +112,11 @@ class MQTTHandler:
         self._client.loop_stop()
         self._client.disconnect()
 
+    def is_connected(self) -> bool:
+        """Whether the underlying paho client currently holds an open
+        broker connection. Used by app.py's /health endpoint."""
+        return self._client.is_connected()
+
     # -------------------------------------------------------------------
     # paho-mqtt Callbacks (CallbackAPIVersion.VERSION2 signatures)
     # -------------------------------------------------------------------
@@ -104,9 +124,8 @@ class MQTTHandler:
     def _on_connect(self, client, userdata, flags, reason_code, properties):
         if reason_code == 0:
             logger.info("Connected to MQTT broker")
-            topics = [(topic, qos) for topic, qos in _SUBSCRIPTIONS]
-            client.subscribe(topics)
-            for topic, qos in _SUBSCRIPTIONS:
+            client.subscribe(self._subscriptions)
+            for topic, qos in self._subscriptions:
                 logger.info("Subscribed to %s (QoS %d)", topic, qos)
         else:
             logger.error("Failed to connect to MQTT broker: %s", reason_code)
@@ -131,7 +150,7 @@ class MQTTHandler:
 
     def _handle_message(self, topic: str, raw_payload: bytes) -> None:
         parts = topic.split("/")
-        if len(parts) != 3 or parts[0] != "fleet":
+        if len(parts) != 3 or parts[0] != self._topic_prefix:
             logger.warning("Ignoring message on unexpected topic shape: %s", topic)
             return
 
@@ -176,3 +195,4 @@ class MQTTHandler:
             logger.exception("Failed to persist %s message from device %s", message_type, device_id)
         finally:
             session.close()
+
