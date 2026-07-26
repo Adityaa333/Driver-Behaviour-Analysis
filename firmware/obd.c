@@ -1,162 +1,391 @@
 // Design notes:
 
-// Bus-off detection/recovery runs at the start of every obd_read() call rather than only at init 
-// — a real vehicle CAN bus can enter bus-off mid-trip (e.g. a loose harness connector), 
-// and a commercial fleet device shouldn't need a power cycle to recover from that.
-// The response-matching loop discards unrelated CAN traffic instead of assuming the very next frame is the answer 
-// — other modules on the bus (ABS, airbag, etc.) are also broadcasting, and a naive "read one frame" implementation 
-// would misparse those as PID responses.
-// valid_count == 0 (all four PIDs timed out) is treated as a distinct error case from partial success,
-//  since that specific pattern usually means "ignition off / adapter unplugged" rather than "one sensor glitched."
+// This version replaces the TWAI/CAN transport with a Bluetooth Classic
+// SPP link to an ELM327-compatible OBD-II dongle. The public contract in
+// obd.h (obd_data_t, obd_init(), obd_read()) is UNCHANGED so sensor_manager.c
+// and everything downstream of it needs no modification at all.
+//
+// Requires the following new macros in config.h (not shown here):
+//   OBD_BT_TARGET_MAC        - 6-byte esp_bd_addr_t of the paired dongle
+//   OBD_BT_SPP_SCN           - remote SPP server channel number. Many
+//                              cheap ELM327 clones fix this at 1; if yours
+//                              doesn't, run an SDP discovery once during
+//                              bring-up to find the real channel and hard
+//                              code it here.
+//   OBD_BT_CONNECT_TIMEOUT_MS
+//   OBD_BT_RECONNECT_DELAY_MS
+//   OBD_REQUEST_TIMEOUT_MS   - must be raised from the CAN-era 100ms;
+//                              Bluetooth SPP round trips are far slower.
+//                              300-500ms is a more realistic starting point.
+//
+// A single background task (obd_bt_connection_task) owns the SPP
+// connection lifecycle: it connects at startup and reconnects
+// automatically (bounded retry + backoff, mirroring wifi_manager.c's
+// approach) whenever the link drops - a Bluetooth link to a dongle
+// riding around in a vehicle will drop, and this module must recover
+// without requiring a device reboot.
+//
+// Bytes arriving from the dongle are pushed onto a FreeRTOS queue by the
+// SPP data-indication callback (which runs in the Bluedroid callback
+// context, not our own task) and consumed by whichever task is currently
+// waiting on a command's response inside obd_request_pid_locked(). Only
+// one request is ever in flight at a time, enforced by s_bus_mutex - this
+// plays the same role s_bus_mutex played in the CAN version.
+// ============================================================================
 
 /* ============================================================================
  * obd.c
  *
- * Implementation of the OBD-II driver declared in obd.h.
+ * Implementation of the OBD-II driver declared in obd.h, using a
+ * Bluetooth Classic SPP connection to an ELM327-compatible dongle
+ * instead of a directly-wired CAN transceiver.
  *
- * Uses the ESP-IDF TWAI driver to send standard Mode 01 PID requests as a
- * functional broadcast (identifier 0x7DF) and waits for the ECU's response
- * (identifier 0x7E8, the standard single-ECU reply address). Includes
- * bus-off detection and automatic recovery, since a vehicle CAN bus is a
- * noisy electrical environment compared to a lab bench.
+ * ELM327 "AT" commands and Mode 01 PID requests are plain ASCII text
+ * terminated by '\r'; responses are ASCII hex terminated by a '>' prompt
+ * character. This module hides all of that framing/parsing behind the
+ * same obd_read() contract the rest of the firmware already depends on.
  * ========================================================================= */
 
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 #include "obd.h"
 #include "config.h"
-#include "driver/twai.h"
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_bt_device.h"
+#include "esp_gap_bt_api.h"
+#include "esp_spp_api.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 
 static const char *TAG = "obd";
 
-/* Standard OBD-II CAN identifiers (11-bit addressing). */
-#define OBD_REQUEST_CAN_ID              0x7DF   /* Functional broadcast */
-#define OBD_RESPONSE_CAN_ID_MIN         0x7E8   /* ECU #1 response */
-#define OBD_RESPONSE_CAN_ID_MAX         0x7EF   /* ECU #8 response */
+#define OBD_RX_QUEUE_LEN            32     /* SPP data chunks buffered */
+#define OBD_RX_CHUNK_MAX_LEN        128    /* Max bytes per queued chunk */
+#define OBD_RESPONSE_BUF_LEN        256    /* Accumulated ASCII response */
+#define OBD_AT_RETRY_COUNT          3
 
-#define OBD_MODE_SHOW_CURRENT_DATA      0x01
-#define OBD_MODE_RESPONSE_OFFSET        0x40    /* Response mode = request + 0x40 */
+typedef struct {
+    uint8_t data[OBD_RX_CHUNK_MAX_LEN];
+    uint16_t len;
+} obd_rx_chunk_t;
 
-static SemaphoreHandle_t s_bus_mutex = NULL;
+static SemaphoreHandle_t s_bus_mutex = NULL;   /* Serializes one request at a time */
+static QueueHandle_t s_rx_queue = NULL;        /* SPP callback -> waiting task */
+
+static uint32_t s_spp_handle = 0;
+static volatile bool s_spp_connected = false;
+static volatile bool s_elm327_configured = false;
 static bool s_initialized = false;
 
+static const esp_bd_addr_t s_target_addr = OBD_BT_TARGET_MAC;
+
 /* ---------------------------------------------------------------------------
- * Bus Health
+ * SPP Response Reading
  * ------------------------------------------------------------------------- */
 
 /**
- * @brief Check the TWAI controller state and attempt recovery if the bus
- *        has entered the bus-off state (e.g. after sustained electrical
- *        noise or a disconnected harness). Caller must hold s_bus_mutex.
+ * @brief Drain the RX queue, accumulating bytes into out_buf until a '>'
+ *        prompt character is seen (ELM327's end-of-response marker) or
+ *        the timeout elapses. Caller must hold s_bus_mutex.
+ *
+ * @return ESP_OK if a full response (terminated by '>') was captured,
+ *         ESP_ERR_TIMEOUT otherwise.
  */
-static void obd_check_bus_health_locked(void)
+static esp_err_t obd_read_response_until_prompt_locked(char *out_buf, size_t out_buf_len,
+                                                        uint32_t timeout_ms)
 {
-    twai_status_info_t status;
-    esp_err_t err = twai_get_status_info(&status);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "twai_get_status_info failed: %s", esp_err_to_name(err));
-        return;
-    }
+    size_t written = 0;
+    out_buf[0] = '\0';
 
-    if (status.state == TWAI_STATE_BUS_OFF) {
-        ESP_LOGW(TAG, "CAN bus is in BUS_OFF state, initiating recovery");
-        err = twai_initiate_recovery();
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "twai_initiate_recovery failed: %s", esp_err_to_name(err));
-            return;
+    int64_t deadline_us = esp_timer_get_time() + ((int64_t)timeout_ms * 1000);
+
+    for (;;) {
+        int64_t remaining_ms = (deadline_us - esp_timer_get_time()) / 1000;
+        if (remaining_ms <= 0) {
+            ESP_LOGW(TAG, "Timed out waiting for ELM327 prompt");
+            return ESP_ERR_TIMEOUT;
         }
-        /* Recovery takes 128 occurrences of bus-idle condition per the CAN
-         * spec; give it a moment before attempting to restart. */
-        vTaskDelay(pdMS_TO_TICKS(100));
-        err = twai_start();
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "twai_start after recovery failed: %s", esp_err_to_name(err));
-        } else {
-            ESP_LOGI(TAG, "CAN bus recovered and restarted");
+
+        obd_rx_chunk_t chunk;
+        if (xQueueReceive(s_rx_queue, &chunk, pdMS_TO_TICKS(remaining_ms)) != pdTRUE) {
+            continue; /* Loop re-checks the overall deadline */
+        }
+
+        for (uint16_t i = 0; i < chunk.len && written < (out_buf_len - 1); i++) {
+            out_buf[written++] = (char)chunk.data[i];
+            if (chunk.data[i] == '>') {
+                out_buf[written] = '\0';
+                return ESP_OK;
+            }
         }
     }
 }
 
+/**
+ * @brief Send a raw ASCII command (already including its trailing '\r')
+ *        to the connected dongle and wait for the '>' terminated
+ *        response. Caller must hold s_bus_mutex.
+ */
+static esp_err_t obd_send_command_locked(const char *cmd, char *resp_buf, size_t resp_buf_len,
+                                          uint32_t timeout_ms)
+{
+    if (!s_spp_connected) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Drain any stale bytes left over from a previous exchange (e.g. a
+     * late duplicate response) before sending a new command, so they
+     * can't be misread as part of this command's response. */
+    obd_rx_chunk_t stale;
+    while (xQueueReceive(s_rx_queue, &stale, 0) == pdTRUE) {
+        /* discard */
+    }
+
+    esp_err_t err = esp_spp_write(s_spp_handle, (int)strlen(cmd), (uint8_t *)cmd);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_spp_write failed for command \"%s\": %s", cmd, esp_err_to_name(err));
+        return ESP_ERR_TIMEOUT;
+    }
+
+    return obd_read_response_until_prompt_locked(resp_buf, resp_buf_len, timeout_ms);
+}
+
 /* ---------------------------------------------------------------------------
- * PID Request / Response
+ * ELM327 Setup (AT Commands)
  * ------------------------------------------------------------------------- */
 
 /**
- * @brief Send a Mode 01 request for a single PID and wait for the matching
- *        response, discarding any unrelated frames received in the
- *        meantime. Caller must hold s_bus_mutex.
+ * @brief Run the standard ELM327 reset/configuration sequence after a
+ *        fresh SPP connection: reset, echo off, linefeeds off, auto
+ *        protocol select. Caller must hold s_bus_mutex.
+ */
+static esp_err_t obd_elm327_configure_locked(void)
+{
+    static const char *const setup_cmds[] = {
+        "ATZ\r",    /* Reset */
+        "ATE0\r",   /* Echo off - avoids re-parsing our own command text */
+        "ATL0\r",   /* Linefeeds off - simplifies response parsing */
+        "ATSP0\r",  /* Auto-select OBD-II protocol */
+    };
+
+    char resp[OBD_RESPONSE_BUF_LEN];
+
+    for (size_t i = 0; i < sizeof(setup_cmds) / sizeof(setup_cmds[0]); i++) {
+        esp_err_t err = ESP_ERR_TIMEOUT;
+        for (int attempt = 1; attempt <= OBD_AT_RETRY_COUNT && err != ESP_OK; attempt++) {
+            err = obd_send_command_locked(setup_cmds[i], resp, sizeof(resp),
+                                           OBD_REQUEST_TIMEOUT_MS);
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "ELM327 setup command \"%s\" failed", setup_cmds[i]);
+            return err;
+        }
+        /* ATZ reboots the adapter's own microcontroller; give it a beat
+         * before sending the next command. */
+        if (i == 0) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
+
+    ESP_LOGI(TAG, "ELM327 adapter configured");
+    return ESP_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * PID Request / Response Parsing
+ * ------------------------------------------------------------------------- */
+
+/**
+ * @brief Parse an ELM327 Mode 01 response line such as "41 0C 1A F8" into
+ *        its data bytes. Tolerant of the "SEARCHING..." line some
+ *        adapters prepend and of embedded whitespace/CR.
  *
- * @param[in]  pid        The OBD-II PID to request.
- * @param[out] out_byte_a First data byte (A) of the response.
- * @param[out] out_byte_b Second data byte (B) of the response, only valid
- *                         if the response frame contained one (i.e. its
- *                         DLC indicates at least 5 payload bytes).
- * @param[out] out_has_byte_b Set true if out_byte_b was populated.
- * @return ESP_OK on a valid matching response, ESP_ERR_TIMEOUT otherwise.
+ * @return true if a well-formed "41 <pid> ..." response was found.
+ */
+static bool obd_parse_pid_response(const char *resp, uint8_t pid,
+                                    uint8_t *out_byte_a, uint8_t *out_byte_b,
+                                    bool *out_has_byte_b)
+{
+    char work_buf[OBD_RESPONSE_BUF_LEN];
+    strncpy(work_buf, resp, sizeof(work_buf) - 1);
+    work_buf[sizeof(work_buf) - 1] = '\0';
+
+    char *saveptr = NULL;
+    char *tok = strtok_r(work_buf, " \r\n", &saveptr);
+
+    uint8_t bytes[8];
+    int byte_count = 0;
+    bool found_header = false;
+
+    while (tok != NULL) {
+        /* Skip non-hex noise such as "SEARCHING..." or the trailing '>'. */
+        if (strlen(tok) == 2 && isxdigit((unsigned char)tok[0]) && isxdigit((unsigned char)tok[1])) {
+            uint8_t val = (uint8_t)strtol(tok, NULL, 16);
+
+            if (!found_header) {
+                if (val == 0x41) {
+                    found_header = true; /* Mode 01 response marker */
+                }
+            } else if (byte_count == 0 && val != pid) {
+                /* First byte after 0x41 must echo the requested PID;
+                 * otherwise this is a response to something else. */
+                found_header = false;
+            } else {
+                if (byte_count < (int)sizeof(bytes)) {
+                    bytes[byte_count++] = val;
+                }
+            }
+        }
+        tok = strtok_r(NULL, " \r\n", &saveptr);
+    }
+
+    /* bytes[0] is the echoed PID itself; data starts at bytes[1]. */
+    if (!found_header || byte_count < 2) {
+        return false;
+    }
+
+    *out_byte_a = bytes[1];
+    if (byte_count >= 3) {
+        *out_byte_b = bytes[2];
+        *out_has_byte_b = true;
+    } else {
+        *out_has_byte_b = false;
+    }
+    return true;
+}
+
+/**
+ * @brief Request a single Mode 01 PID over the SPP link and parse its
+ *        response. Caller must hold s_bus_mutex.
  */
 static esp_err_t obd_request_pid_locked(uint8_t pid, uint8_t *out_byte_a,
                                          uint8_t *out_byte_b, bool *out_has_byte_b)
 {
-    twai_message_t tx_msg = {0};
-    tx_msg.identifier = OBD_REQUEST_CAN_ID;
-    tx_msg.extd = 0;              /* Standard 11-bit identifier */
-    tx_msg.rtr = 0;
-    tx_msg.data_length_code = 8;
-    tx_msg.data[0] = 0x02;        /* 2 additional bytes follow: mode + pid */
-    tx_msg.data[1] = OBD_MODE_SHOW_CURRENT_DATA;
-    tx_msg.data[2] = pid;
-    tx_msg.data[3] = 0x00;
-    tx_msg.data[4] = 0x00;
-    tx_msg.data[5] = 0x00;
-    tx_msg.data[6] = 0x00;
-    tx_msg.data[7] = 0x00;
+    if (!s_spp_connected || !s_elm327_configured) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
-    esp_err_t err = twai_transmit(&tx_msg, pdMS_TO_TICKS(OBD_REQUEST_TIMEOUT_MS));
+    char cmd[8];
+    snprintf(cmd, sizeof(cmd), "01%02X\r", pid);
+
+    char resp[OBD_RESPONSE_BUF_LEN];
+    esp_err_t err = obd_send_command_locked(cmd, resp, sizeof(resp), OBD_REQUEST_TIMEOUT_MS);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "twai_transmit failed for PID 0x%02X: %s", pid, esp_err_to_name(err));
+        ESP_LOGW(TAG, "Timed out waiting for response to PID 0x%02X", pid);
         return ESP_ERR_TIMEOUT;
     }
 
-    int64_t deadline_us = esp_timer_get_time() + ((int64_t)OBD_REQUEST_TIMEOUT_MS * 1000);
+    if (!obd_parse_pid_response(resp, pid, out_byte_a, out_byte_b, out_has_byte_b)) {
+        ESP_LOGW(TAG, "Unparseable/negative response for PID 0x%02X: \"%s\"", pid, resp);
+        return ESP_ERR_TIMEOUT;
+    }
 
-    while (esp_timer_get_time() < deadline_us) {
-        int64_t remaining_ms = (deadline_us - esp_timer_get_time()) / 1000;
-        if (remaining_ms <= 0) {
+    return ESP_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * SPP Event Handling
+ * ------------------------------------------------------------------------- */
+
+static void obd_spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
+{
+    switch (event) {
+        case ESP_SPP_INIT_EVT:
+            ESP_LOGI(TAG, "SPP initialized");
+            break;
+
+        case ESP_SPP_OPEN_EVT:
+            ESP_LOGI(TAG, "SPP connection opened to OBD dongle");
+            s_spp_handle = param->open.handle;
+            s_spp_connected = true;
+            s_elm327_configured = false;
+            break;
+
+        case ESP_SPP_CLOSE_EVT:
+            ESP_LOGW(TAG, "SPP connection closed, will attempt reconnect");
+            s_spp_connected = false;
+            s_elm327_configured = false;
+            break;
+
+        case ESP_SPP_DATA_IND_EVT: {
+            /* Runs in the Bluedroid callback context - keep this fast
+             * and non-blocking; just hand the bytes off to whichever
+             * task is waiting inside obd_read_response_until_prompt_locked(). */
+            obd_rx_chunk_t chunk;
+            uint16_t len = param->data_ind.len;
+            if (len > OBD_RX_CHUNK_MAX_LEN) {
+                len = OBD_RX_CHUNK_MAX_LEN;
+            }
+            memcpy(chunk.data, param->data_ind.data, len);
+            chunk.len = len;
+            if (xQueueSend(s_rx_queue, &chunk, 0) != pdTRUE) {
+                ESP_LOGW(TAG, "OBD RX queue full, dropping data chunk");
+            }
             break;
         }
 
-        twai_message_t rx_msg;
-        err = twai_receive(&rx_msg, pdMS_TO_TICKS(remaining_ms));
-        if (err != ESP_OK) {
-            continue; /* Timeout on this attempt; loop checks overall deadline */
-        }
-
-        bool id_in_range = (rx_msg.identifier >= OBD_RESPONSE_CAN_ID_MIN) &&
-                            (rx_msg.identifier <= OBD_RESPONSE_CAN_ID_MAX);
-        bool mode_matches = (rx_msg.data_length_code >= 3) &&
-                             (rx_msg.data[1] == (OBD_MODE_SHOW_CURRENT_DATA + OBD_MODE_RESPONSE_OFFSET)) &&
-                             (rx_msg.data[2] == pid);
-
-        if (id_in_range && mode_matches) {
-            *out_byte_a = rx_msg.data[3];
-            if (rx_msg.data_length_code >= 5) {
-                *out_byte_b = rx_msg.data[4];
-                *out_has_byte_b = true;
-            } else {
-                *out_has_byte_b = false;
-            }
-            return ESP_OK;
-        }
-        /* Frame did not match (unrelated bus traffic); keep waiting until
-         * the deadline. */
+        default:
+            break;
     }
+}
 
-    ESP_LOGW(TAG, "Timed out waiting for response to PID 0x%02X", pid);
-    return ESP_ERR_TIMEOUT;
+/* ---------------------------------------------------------------------------
+ * Connection Management Task
+ * ------------------------------------------------------------------------- */
+
+/**
+ * @brief Owns the connect/reconnect lifecycle: attempts an SPP connection
+ *        to OBD_BT_TARGET_MAC, waits for it to come up, runs the ELM327
+ *        setup sequence, then blocks until the link drops and repeats -
+ *        indefinitely, so a mid-trip Bluetooth dropout recovers on its
+ *        own without a reboot (mirroring wifi_manager.c's philosophy).
+ */
+static void obd_bt_connection_task(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        if (!s_spp_connected) {
+            ESP_LOGI(TAG, "Attempting SPP connection to OBD dongle");
+            esp_err_t err = esp_spp_connect(ESP_SPP_SEC_NONE, ESP_SPP_ROLE_MASTER,
+                                             OBD_BT_SPP_SCN, (uint8_t *)s_target_addr);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "esp_spp_connect failed: %s", esp_err_to_name(err));
+            }
+
+            /* Wait for ESP_SPP_OPEN_EVT (or the timeout) before deciding
+             * whether to configure the adapter or back off and retry. */
+            int64_t deadline_us = esp_timer_get_time() +
+                                   ((int64_t)OBD_BT_CONNECT_TIMEOUT_MS * 1000);
+            while (!s_spp_connected && esp_timer_get_time() < deadline_us) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+        }
+
+        if (s_spp_connected && !s_elm327_configured) {
+            if (xSemaphoreTake(s_bus_mutex, pdMS_TO_TICKS(MUTEX_MAX_WAIT_MS)) == pdTRUE) {
+                esp_err_t err = obd_elm327_configure_locked();
+                s_elm327_configured = (err == ESP_OK);
+                xSemaphoreGive(s_bus_mutex);
+            }
+        }
+
+        if (!s_spp_connected) {
+            ESP_LOGW(TAG, "OBD dongle not connected, retrying in %d ms",
+                     OBD_BT_RECONNECT_DELAY_MS);
+            vTaskDelay(pdMS_TO_TICKS(OBD_BT_RECONNECT_DELAY_MS));
+        } else {
+            /* Connected and configured; just idle-check periodically so
+             * a future disconnect is noticed and re-enters this loop. */
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -175,29 +404,63 @@ esp_err_t obd_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
-        OBD_TWAI_TX_GPIO, OBD_TWAI_RX_GPIO, TWAI_MODE_NORMAL);
+    s_rx_queue = xQueueCreate(OBD_RX_QUEUE_LEN, sizeof(obd_rx_chunk_t));
+    if (s_rx_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create OBD RX queue");
+        return ESP_ERR_NO_MEM;
+    }
 
-    /* OBD_CAN_BITRATE_BPS is fixed at 500000 in config.h, the standard
-     * ISO 15765-4 (CAN) OBD-II bus speed used by the vast majority of
-     * passenger vehicles built since 2008. */
-    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
-    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-
-    esp_err_t err = twai_driver_install(&g_config, &t_config, &f_config);
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    esp_err_t err = esp_bt_controller_init(&bt_cfg);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "twai_driver_install failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "esp_bt_controller_init failed: %s", esp_err_to_name(err));
         return ESP_ERR_INVALID_STATE;
     }
 
-    err = twai_start();
+    err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "twai_start failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "esp_bt_controller_enable failed: %s", esp_err_to_name(err));
         return ESP_ERR_INVALID_STATE;
+    }
+
+    err = esp_bluedroid_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_bluedroid_init failed: %s", esp_err_to_name(err));
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    err = esp_bluedroid_enable();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_bluedroid_enable failed: %s", esp_err_to_name(err));
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    err = esp_spp_register_callback(obd_spp_callback);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_spp_register_callback failed: %s", esp_err_to_name(err));
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_spp_cfg_t spp_cfg = {
+        .mode = ESP_SPP_MODE_CB,
+        .enable_l2cap_ertm = true,
+    };
+    err = esp_spp_enhanced_init(&spp_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_spp_enhanced_init failed: %s", esp_err_to_name(err));
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    BaseType_t task_created = xTaskCreatePinnedToCore(
+        obd_bt_connection_task, "obd_bt_conn_task", TASK_STACK_SIZE_OBD, NULL,
+        TASK_PRIORITY_OBD, NULL, TASK_CORE_SENSOR_ACQUISITION);
+    if (task_created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create OBD Bluetooth connection task");
+        return ESP_ERR_NO_MEM;
     }
 
     s_initialized = true;
-    ESP_LOGI(TAG, "OBD-II TWAI driver initialized at %d bps", OBD_CAN_BITRATE_BPS);
+    ESP_LOGI(TAG, "OBD-II Bluetooth (SPP/ELM327) driver initialized");
     return ESP_OK;
 }
 
@@ -210,12 +473,17 @@ esp_err_t obd_read(obd_data_t *data)
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (!s_spp_connected || !s_elm327_configured) {
+        /* Not connected right now - same "report honestly, don't hold
+         * stale data" behavior as the CAN version's bus-disconnected
+         * case; sensor_manager's OBD task clears its cache on this. */
+        return ESP_ERR_TIMEOUT;
+    }
+
     if (xSemaphoreTake(s_bus_mutex, pdMS_TO_TICKS(MUTEX_MAX_WAIT_MS)) != pdTRUE) {
         ESP_LOGE(TAG, "Timed out acquiring OBD bus mutex");
         return ESP_ERR_TIMEOUT;
     }
-
-    obd_check_bus_health_locked();
 
     memset(data, 0, sizeof(obd_data_t));
     uint8_t byte_a = 0, byte_b = 0;
@@ -256,7 +524,7 @@ esp_err_t obd_read(obd_data_t *data)
     data->timestamp_us = esp_timer_get_time();
 
     if (valid_count == 0) {
-        ESP_LOGW(TAG, "No OBD-II PIDs responded this cycle (bus disconnected?)");
+        ESP_LOGW(TAG, "No OBD-II PIDs responded this cycle (dongle disconnected/ignition off?)");
         return ESP_ERR_TIMEOUT;
     }
 

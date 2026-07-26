@@ -3,26 +3,40 @@ api.py
 
 REST API router for the Driver Behaviour Analysis System backend.
 
-Exposes read-only endpoints consumed primarily by the Node-RED
-dashboard to query devices, raw telemetry, computed driver safety
-scores, alerts, crashes, and status for each fleet device.
+Exposes read-only endpoints consumed primarily by the Node-RED dashboard
+(dashboard/flow.json) and any other downstream consumer.
 
-FIX NOTE (see accompanying compatibility review): the previous version
-of this file imported `Alert, Driver, ScoreRecord, SensorReading, Trip`
-from database.py and modeled a driver/trip-centric schema. None of
-those names exist in database.py, which is device_id-keyed and mirrors
-the five MQTT payload types the firmware actually publishes
-(fleet/{device_id}/telemetry|score|alert|crash|status). This version
-is rewritten against that real schema so the import succeeds and the
-response fields match what's actually stored.
+IMPORTANT SCHEMA NOTE
+----------------------
+This module was previously written against a Driver/Trip/SensorReading
+schema that does not exist anywhere in this codebase - the firmware
+publishes per-device telemetry/score/alert/crash/status messages keyed
+only by device_id (a MAC-derived hex string), and mqtt_handler.py writes
+exactly that shape into database.py's actual tables: Device,
+TelemetryRecord, ScoreRecord, AlertRecord, CrashRecord, StatusRecord.
+There is no "driver" or "trip" entity produced anywhere in this system.
 
-All write paths are intentionally excluded from this router; writes
-happen exclusively via mqtt_handler.py as messages arrive from ESP32
-fleet devices.
+This rewrite queries the schema that is actually populated. The
+dashboard's existing HTTP request nodes call
+    GET /api/v1/drivers/{driverId}/score
+    GET /api/v1/drivers/{driverId}/alerts?limit=10
+using a "driver_id" dropdown value (e.g. "DRV-001") - to avoid having to
+edit dashboard/flow.json as well, the /drivers/... routes below are kept
+but the path parameter is treated as a device_id under the hood. For a
+real fleet deployment, update the dropdown in flow.json to use actual
+device IDs (12-hex-char strings derived from each ESP32's MAC address,
+see mqtt_client.c) instead of placeholder "DRV-00N" values.
+
+Write paths into the underlying tables are intentionally excluded from
+this router: telemetry/score/alert/crash/status rows are written
+exclusively by mqtt_handler.py as MQTT messages arrive from fleet
+devices. Keeping a single writer per table avoids race conditions and
+keeps this API's contract purely query-oriented.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from typing import Generator, List, Optional
@@ -34,12 +48,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from database import (
+    Device,
+    TelemetryRecord,
+    ScoreRecord,
     AlertRecord,
     CrashRecord,
-    Device,
-    ScoreRecord,
     StatusRecord,
-    TelemetryRecord,
     get_session,
 )
 
@@ -60,15 +74,12 @@ DEFAULT_PAGE_SIZE = 50
 def get_db() -> Generator[Session, None, None]:
     """
     FastAPI dependency that yields a database session scoped to a
-    single request. sqlalchemy.orm.Session supports the context
-    manager protocol directly (close()-on-exit), which is what
-    get_session() returns.
+    single request. SQLAlchemy's Session object is itself a context
+    manager (closes on exit); get_session() just returns a plain
+    Session instance, which the 'with' block below manages correctly.
     """
-    session = get_session()
-    try:
+    with get_session() as session:
         yield session
-    finally:
-        session.close()
 
 
 # --------------------------------------------------------------------------
@@ -111,16 +122,20 @@ class TelemetryOut(BaseModel):
     throttle_position_valid: Optional[bool] = None
     throttle_position_pct: Optional[float] = None
 
-    received_at: datetime
-
 
 class ScoreOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    """
+    Dashboard-compatible score payload. dashboard/flow.json's
+    'Format Safety Score' function node reads msg.payload.safety_score
+    and msg.payload.rating, so those keys are synthesized here from the
+    real 'score' column rather than renaming the column itself (the
+    firmware/backend on-the-wire field is legitimately called "score";
+    only this HTTP response shapes it for the existing dashboard).
+    """
 
-    id: int
     device_id: str
     timestamp_ms: int
-    score: float
+    safety_score: float
     rating: str
     harsh_braking_count: int
     harsh_accel_count: int
@@ -129,54 +144,23 @@ class ScoreOut(BaseModel):
     idling_seconds_total: float
     crash_count: int
     geofence_violation_count: int
-    received_at: datetime
-
-    @staticmethod
-    def rating_for(score: float) -> str:
-        """Simple score->label bucketing for dashboard display. Not a
-        stored column since it's purely derived from `score`."""
-        if score >= 90:
-            return "Excellent"
-        if score >= 75:
-            return "Good"
-        if score >= 50:
-            return "Fair"
-        return "Poor"
-
-
-def _score_to_out(record: ScoreRecord) -> ScoreOut:
-    """ScoreRecord has no `rating` column - it's purely derived from
-    `score` - so it can't go through ScoreOut.model_validate(record)
-    directly (that requires every required field to already be present
-    on the source object). Build the dict explicitly instead."""
-    return ScoreOut(
-        id=record.id,
-        device_id=record.device_id,
-        timestamp_ms=record.timestamp_ms,
-        score=record.score,
-        rating=ScoreOut.rating_for(record.score),
-        harsh_braking_count=record.harsh_braking_count,
-        harsh_accel_count=record.harsh_accel_count,
-        harsh_cornering_count=record.harsh_cornering_count,
-        overspeed_count=record.overspeed_count,
-        idling_seconds_total=record.idling_seconds_total,
-        crash_count=record.crash_count,
-        geofence_violation_count=record.geofence_violation_count,
-        received_at=record.received_at,
-    )
 
 
 class AlertOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    """
+    Dashboard-compatible alert payload. dashboard/flow.json's
+    'Format Alerts Table' function node reads item.timestamp,
+    item.alert_type, item.severity, item.message - none of which exist
+    as columns on AlertRecord (which stores alert_type plus a raw JSON
+    blob), so severity/message are derived here.
+    """
 
-    id: int
-    device_id: str
-    timestamp_ms: int
+    timestamp: int
     alert_type: str
+    severity: str
+    message: str
     latitude_deg: Optional[float] = None
     longitude_deg: Optional[float] = None
-    raw_payload_json: str
-    received_at: datetime
 
 
 class CrashOut(BaseModel):
@@ -187,24 +171,14 @@ class CrashOut(BaseModel):
     timestamp_ms: int
     total_accel_g: float
     total_gyro_dps: float
-    accel_x_g: Optional[float] = None
-    accel_y_g: Optional[float] = None
-    accel_z_g: Optional[float] = None
-    gyro_x_dps: Optional[float] = None
-    gyro_y_dps: Optional[float] = None
-    gyro_z_dps: Optional[float] = None
-    gps_fix_valid: Optional[bool] = None
     latitude_deg: Optional[float] = None
     longitude_deg: Optional[float] = None
     speed_kmh: Optional[float] = None
-    heading_deg: Optional[float] = None
-    received_at: datetime
 
 
 class StatusOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
     device_id: str
     timestamp_ms: int
     uptime_sec: Optional[int] = None
@@ -214,26 +188,16 @@ class StatusOut(BaseModel):
     mqtt_connected: Optional[bool] = None
     wifi_rssi_dbm: Optional[int] = None
     current_driver_score: Optional[float] = None
-    received_at: datetime
-
-
-class DeviceSummaryOut(BaseModel):
-    """Aggregated, dashboard-friendly summary for a single device."""
-
-    device_id: str
-    latest_score: Optional[float] = None
-    latest_rating: Optional[str] = None
-    total_alerts: int
-    total_crashes: int
-    last_seen_at: Optional[datetime] = None
-    wifi_connected: Optional[bool] = None
-    mqtt_connected: Optional[bool] = None
 
 
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
 def _run_query(db: Session, description: str, fn):
+    """
+    Executes a query callable, translating SQLAlchemy failures into a
+    uniform 500 response while logging full detail server-side.
+    """
     try:
         return fn()
     except SQLAlchemyError:
@@ -245,6 +209,10 @@ def _run_query(db: Session, description: str, fn):
 
 
 def _paging(limit: int, offset: int) -> tuple[int, int]:
+    """
+    Validates and clamps pagination parameters. Raises HTTP 400 for
+    negative offsets rather than silently coercing them.
+    """
     if offset < 0:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -253,13 +221,57 @@ def _paging(limit: int, offset: int) -> tuple[int, int]:
     return min(limit, MAX_PAGE_SIZE), offset
 
 
-def _require_device(db: Session, device_id: str) -> None:
-    exists = db.query(Device.device_id).filter(Device.device_id == device_id).first()
-    if exists is None:
+def _rating_for_score(score: float) -> str:
+    """
+    Buckets a numeric score into the same tiers dashboard/flow.json's
+    gauge already visualizes (seg1=50, seg2=80 on node_gauge_score).
+    """
+    if score >= 80:
+        return "Excellent"
+    if score >= 50:
+        return "Fair"
+    return "Poor"
+
+
+def _severity_and_message_for_alert(record: AlertRecord) -> tuple[str, str]:
+    """
+    Derives a human-readable severity/message pair from an AlertRecord.
+    Only two alert_type values are ever published by the firmware:
+    "excessive_idling" (idling_detection.c) and "geofence_violation"
+    (geofence.c). Crashes are a separate, higher-severity MQTT topic
+    and table (CrashRecord) entirely, not part of AlertRecord.
+    """
+    try:
+        payload = json.loads(record.raw_payload_json)
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+
+    if record.alert_type == "geofence_violation":
+        zone_name = payload.get("zone_name", "unknown zone")
+        event = payload.get("event", "transitioned")
+        return "High", f"Vehicle {event} geofence zone \"{zone_name}\""
+
+    if record.alert_type == "excessive_idling":
+        duration = payload.get("duration_seconds")
+        duration_str = f"{duration:.0f}s" if isinstance(duration, (int, float)) else "unknown duration"
+        return "Medium", f"Excessive idling detected ({duration_str})"
+
+    # The firmware only ever publishes the two alert_type values handled
+    # above (idling_detection.c, geofence.c); anything else is unexpected
+    # and worth surfacing in logs for debugging, though it shouldn't break
+    # the response.
+    logger.warning("Unexpected alert_type '%s' from device %s", record.alert_type, record.device_id)
+    return "Low", f"Alert: {record.alert_type}"
+
+
+def _get_device_or_404(db: Session, device_id: str) -> Device:
+    device = db.query(Device).filter(Device.device_id == device_id).one_or_none()
+    if device is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Device {device_id} not found.",
+            detail=f"Device '{device_id}' not found.",
         )
+    return device
 
 
 # --------------------------------------------------------------------------
@@ -272,7 +284,7 @@ def list_devices(
     db: Session = Depends(get_db),
 ) -> List[Device]:
     """Returns a paginated list of devices that have reported at least
-    one message, most recently active first."""
+    one message, most recently seen first."""
     limit, offset = _paging(limit, offset)
 
     def query():
@@ -289,60 +301,12 @@ def list_devices(
 
 @router.get("/devices/{device_id}", response_model=DeviceOut, tags=["devices"])
 def get_device(device_id: str, db: Session = Depends(get_db)) -> Device:
+    """Returns a single device by id, or 404 if it has never reported."""
+
     def query():
-        return db.query(Device).filter(Device.device_id == device_id).one_or_none()
+        return _get_device_or_404(db, device_id)
 
-    device = _run_query(db, "get_device", query)
-    if device is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Device {device_id} not found.",
-        )
-    return device
-
-
-@router.get(
-    "/devices/{device_id}/summary",
-    response_model=DeviceSummaryOut,
-    tags=["devices"],
-)
-def get_device_summary(device_id: str, db: Session = Depends(get_db)) -> DeviceSummaryOut:
-    """Aggregated safety summary for a device: latest score/rating,
-    alert/crash counts, connectivity. Backs a single dashboard widget."""
-
-    def query() -> DeviceSummaryOut:
-        _require_device(db, device_id)
-
-        latest_score_row = (
-            db.query(ScoreRecord)
-            .filter(ScoreRecord.device_id == device_id)
-            .order_by(desc(ScoreRecord.timestamp_ms))
-            .first()
-        )
-        latest_status_row = (
-            db.query(StatusRecord)
-            .filter(StatusRecord.device_id == device_id)
-            .order_by(desc(StatusRecord.timestamp_ms))
-            .first()
-        )
-        total_alerts = db.query(AlertRecord).filter(AlertRecord.device_id == device_id).count()
-        total_crashes = db.query(CrashRecord).filter(CrashRecord.device_id == device_id).count()
-        device = db.query(Device).filter(Device.device_id == device_id).one()
-
-        return DeviceSummaryOut(
-            device_id=device_id,
-            latest_score=latest_score_row.score if latest_score_row else None,
-            latest_rating=(
-                ScoreOut.rating_for(latest_score_row.score) if latest_score_row else None
-            ),
-            total_alerts=total_alerts,
-            total_crashes=total_crashes,
-            last_seen_at=device.last_seen_at,
-            wifi_connected=latest_status_row.wifi_connected if latest_status_row else None,
-            mqtt_connected=latest_status_row.mqtt_connected if latest_status_row else None,
-        )
-
-    return _run_query(db, "get_device_summary", query)
+    return _run_query(db, "get_device", query)
 
 
 # --------------------------------------------------------------------------
@@ -359,16 +323,15 @@ def get_device_telemetry(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ) -> List[TelemetryRecord]:
-    """Chronological (oldest-first) telemetry starting at `offset`. Use
-    /telemetry/latest for a live dashboard tile instead."""
+    """Returns historical telemetry for a device, most recent first."""
     limit, offset = _paging(limit, offset)
 
     def query():
-        _require_device(db, device_id)
+        _get_device_or_404(db, device_id)
         return (
             db.query(TelemetryRecord)
             .filter(TelemetryRecord.device_id == device_id)
-            .order_by(TelemetryRecord.timestamp_ms)
+            .order_by(desc(TelemetryRecord.timestamp_ms))
             .offset(offset)
             .limit(limit)
             .all()
@@ -387,11 +350,11 @@ def get_device_latest_telemetry(
     limit: int = Query(20, ge=1, le=MAX_PAGE_SIZE),
     db: Session = Depends(get_db),
 ) -> List[TelemetryRecord]:
-    """Most recent `limit` telemetry rows, newest first. Intended for
-    polling-based live dashboard tiles."""
+    """Returns the most recent `limit` telemetry rows for a device,
+    newest first - intended for near-real-time dashboard polling."""
 
     def query():
-        _require_device(db, device_id)
+        _get_device_or_404(db, device_id)
         return (
             db.query(TelemetryRecord)
             .filter(TelemetryRecord.device_id == device_id)
@@ -405,28 +368,45 @@ def get_device_latest_telemetry(
 
 # --------------------------------------------------------------------------
 # Scores
+#
+# Routes are kept under /drivers/... to match dashboard/flow.json's
+# existing HTTP request nodes without requiring a flow edit; the path
+# parameter is a device_id, not a separate driver entity (see module
+# docstring).
 # --------------------------------------------------------------------------
-@router.get("/devices/{device_id}/score", response_model=ScoreOut, tags=["scores"])
-def get_device_latest_score(device_id: str, db: Session = Depends(get_db)) -> ScoreOut:
-    """Returns the most recent driver safety score for a device, or 404
-    if no score has been published yet."""
+@router.get("/drivers/{device_id}/score", response_model=ScoreOut, tags=["scores"])
+def get_latest_score(device_id: str, db: Session = Depends(get_db)) -> ScoreOut:
+    """Returns the most recent safety score for a device, shaped for
+    dashboard/flow.json's gauge and rating text widgets."""
 
-    def query():
-        _require_device(db, device_id)
-        return (
+    def query() -> ScoreOut:
+        _get_device_or_404(db, device_id)
+        record = (
             db.query(ScoreRecord)
             .filter(ScoreRecord.device_id == device_id)
             .order_by(desc(ScoreRecord.timestamp_ms))
             .first()
         )
-
-    record = _run_query(db, "get_device_latest_score", query)
-    if record is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No score has been published yet for device {device_id}.",
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No score has been published yet for device '{device_id}'.",
+            )
+        return ScoreOut(
+            device_id=record.device_id,
+            timestamp_ms=record.timestamp_ms,
+            safety_score=record.score,
+            rating=_rating_for_score(record.score),
+            harsh_braking_count=record.harsh_braking_count,
+            harsh_accel_count=record.harsh_accel_count,
+            harsh_cornering_count=record.harsh_cornering_count,
+            overspeed_count=record.overspeed_count,
+            idling_seconds_total=record.idling_seconds_total,
+            crash_count=record.crash_count,
+            geofence_violation_count=record.geofence_violation_count,
         )
-    return _score_to_out(record)
+
+    return _run_query(db, "get_latest_score", query)
 
 
 @router.get(
@@ -434,17 +414,18 @@ def get_device_latest_score(device_id: str, db: Session = Depends(get_db)) -> Sc
     response_model=List[ScoreOut],
     tags=["scores"],
 )
-def get_device_score_history(
+def get_score_history(
     device_id: str,
     limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ) -> List[ScoreOut]:
-    """Historical scores, most recent first. Feeds a trend chart."""
+    """Returns a device's historical safety scores, most recent first -
+    intended to feed a trend chart."""
     limit, offset = _paging(limit, offset)
 
-    def query():
-        _require_device(db, device_id)
+    def query() -> List[ScoreOut]:
+        _get_device_or_404(db, device_id)
         records = (
             db.query(ScoreRecord)
             .filter(ScoreRecord.device_id == device_id)
@@ -453,32 +434,46 @@ def get_device_score_history(
             .limit(limit)
             .all()
         )
-        return [_score_to_out(r) for r in records]
+        return [
+            ScoreOut(
+                device_id=r.device_id,
+                timestamp_ms=r.timestamp_ms,
+                safety_score=r.score,
+                rating=_rating_for_score(r.score),
+                harsh_braking_count=r.harsh_braking_count,
+                harsh_accel_count=r.harsh_accel_count,
+                harsh_cornering_count=r.harsh_cornering_count,
+                overspeed_count=r.overspeed_count,
+                idling_seconds_total=r.idling_seconds_total,
+                crash_count=r.crash_count,
+                geofence_violation_count=r.geofence_violation_count,
+            )
+            for r in records
+        ]
 
-    return _run_query(db, "get_device_score_history", query)
+    return _run_query(db, "get_score_history", query)
 
 
 # --------------------------------------------------------------------------
 # Alerts
+#
+# Also kept under /drivers/... for the same dashboard-compatibility
+# reason as the score route above.
 # --------------------------------------------------------------------------
-@router.get(
-    "/devices/{device_id}/alerts",
-    response_model=List[AlertOut],
-    tags=["alerts"],
-)
+@router.get("/drivers/{device_id}/alerts", response_model=List[AlertOut], tags=["alerts"])
 def get_device_alerts(
     device_id: str,
     limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-) -> List[AlertRecord]:
-    """Alerts (excessive idling, geofence violations) for a device,
-    most recent first."""
+) -> List[AlertOut]:
+    """Returns alerts (idling/geofence) for a device, most recent first,
+    shaped for dashboard/flow.json's alerts table widget."""
     limit, offset = _paging(limit, offset)
 
-    def query():
-        _require_device(db, device_id)
-        return (
+    def query() -> List[AlertOut]:
+        _get_device_or_404(db, device_id)
+        records = (
             db.query(AlertRecord)
             .filter(AlertRecord.device_id == device_id)
             .order_by(desc(AlertRecord.timestamp_ms))
@@ -486,6 +481,20 @@ def get_device_alerts(
             .limit(limit)
             .all()
         )
+        result = []
+        for r in records:
+            severity, message = _severity_and_message_for_alert(r)
+            result.append(
+                AlertOut(
+                    timestamp=r.timestamp_ms,
+                    alert_type=r.alert_type,
+                    severity=severity,
+                    message=message,
+                    latitude_deg=r.latitude_deg,
+                    longitude_deg=r.longitude_deg,
+                )
+            )
+        return result
 
     return _run_query(db, "get_device_alerts", query)
 
@@ -494,29 +503,49 @@ def get_device_alerts(
 def list_alerts(
     device_id: Optional[str] = Query(None, description="Filter by device id."),
     alert_type: Optional[str] = Query(
-        None, description="Filter by alert type, e.g. 'excessive_idling' or 'geofence_violation'."
+        None, description="Filter by alert type: excessive_idling or geofence_violation."
     ),
     limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-) -> List[AlertRecord]:
-    """Fleet-wide alerts, most recent first, optionally filtered by
-    device and/or alert type. Backs a fleet-ops "recent incidents" feed."""
+) -> List[AlertOut]:
+    """Returns fleet-wide alerts, most recent first, optionally filtered
+    by device and/or alert type - a fleet-ops "recent incidents" feed."""
     limit, offset = _paging(limit, offset)
 
-    def query():
+    def query() -> List[AlertOut]:
         q = db.query(AlertRecord)
         if device_id is not None:
             q = q.filter(AlertRecord.device_id == device_id)
         if alert_type is not None:
             q = q.filter(AlertRecord.alert_type == alert_type)
-        return q.order_by(desc(AlertRecord.timestamp_ms)).offset(offset).limit(limit).all()
+        records = q.order_by(desc(AlertRecord.timestamp_ms)).offset(offset).limit(limit).all()
+
+        result = []
+        for r in records:
+            severity, message = _severity_and_message_for_alert(r)
+            result.append(
+                AlertOut(
+                    timestamp=r.timestamp_ms,
+                    alert_type=r.alert_type,
+                    severity=severity,
+                    message=message,
+                    latitude_deg=r.latitude_deg,
+                    longitude_deg=r.longitude_deg,
+                )
+            )
+        return result
 
     return _run_query(db, "list_alerts", query)
 
 
 # --------------------------------------------------------------------------
 # Crashes
+#
+# Crashes are the highest-severity event type and deliberately kept in
+# their own table/endpoint rather than folded into /alerts, mirroring
+# how mqtt_client.c/crash_detection.c treat them as a distinct,
+# highest-QoS message type.
 # --------------------------------------------------------------------------
 @router.get(
     "/devices/{device_id}/crashes",
@@ -529,11 +558,11 @@ def get_device_crashes(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ) -> List[CrashRecord]:
-    """Confirmed crash events for a device, most recent first."""
+    """Returns confirmed crash events for a device, most recent first."""
     limit, offset = _paging(limit, offset)
 
     def query():
-        _require_device(db, device_id)
+        _get_device_or_404(db, device_id)
         return (
             db.query(CrashRecord)
             .filter(CrashRecord.device_id == device_id)
@@ -546,51 +575,31 @@ def get_device_crashes(
     return _run_query(db, "get_device_crashes", query)
 
 
-@router.get("/crashes", response_model=List[CrashOut], tags=["crashes"])
-def list_crashes(
-    limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
-    offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db),
-) -> List[CrashRecord]:
-    """Fleet-wide crash events, most recent first. This is the
-    highest-severity table; a fleet dashboard should surface these
-    prominently."""
-    limit, offset = _paging(limit, offset)
-
-    def query():
-        return (
-            db.query(CrashRecord)
-            .order_by(desc(CrashRecord.timestamp_ms))
-            .offset(offset)
-            .limit(limit)
-            .all()
-        )
-
-    return _run_query(db, "list_crashes", query)
-
-
 # --------------------------------------------------------------------------
 # Status
 # --------------------------------------------------------------------------
 @router.get(
-    "/devices/{device_id}/status/latest",
+    "/devices/{device_id}/status",
     response_model=StatusOut,
     tags=["status"],
 )
 def get_device_latest_status(device_id: str, db: Session = Depends(get_db)) -> StatusRecord:
+    """Returns the most recent health/status snapshot for a device
+    (uptime, heap, WiFi/MQTT connectivity, RSSI, current score)."""
+
     def query():
-        _require_device(db, device_id)
-        return (
+        _get_device_or_404(db, device_id)
+        record = (
             db.query(StatusRecord)
             .filter(StatusRecord.device_id == device_id)
             .order_by(desc(StatusRecord.timestamp_ms))
             .first()
         )
+        if record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No status has been published yet for device '{device_id}'.",
+            )
+        return record
 
-    record = _run_query(db, "get_device_latest_status", query)
-    if record is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No status has been published yet for device {device_id}.",
-        )
-    return record
+    return _run_query(db, "get_device_latest_status", query)
