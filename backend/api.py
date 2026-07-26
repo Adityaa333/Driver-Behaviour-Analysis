@@ -16,16 +16,18 @@ exactly that shape into database.py's actual tables: Device,
 TelemetryRecord, ScoreRecord, AlertRecord, CrashRecord, StatusRecord.
 There is no "driver" or "trip" entity produced anywhere in this system.
 
-This rewrite queries the schema that is actually populated. The
-dashboard's existing HTTP request nodes call
-    GET /api/v1/drivers/{driverId}/score
-    GET /api/v1/drivers/{driverId}/alerts?limit=10
-using a "driver_id" dropdown value (e.g. "DRV-001") - to avoid having to
-edit dashboard/flow.json as well, the /drivers/... routes below are kept
-but the path parameter is treated as a device_id under the hood. For a
-real fleet deployment, update the dropdown in flow.json to use actual
-device IDs (12-hex-char strings derived from each ESP32's MAC address,
-see mqtt_client.c) instead of placeholder "DRV-00N" values.
+This rewrite queries the schema that is actually populated. The current
+dashboard/flow.json build calls:
+    GET /api/v1/devices/{deviceId}/score
+    GET /api/v1/devices/{deviceId}/alerts?limit=10
+and parses msg.payload.score / msg.payload.rating for the score gauge,
+and item.timestamp_ms / item.alert_type / item.latitude_deg /
+item.longitude_deg / item.raw_payload_json for the alerts table. The
+routes and response models below match that contract exactly. The
+original /drivers/{device_id}/score and /drivers/{device_id}/alerts
+paths are kept as backward-compatible aliases (same handler, same
+response shape) in case any other consumer still targets them, but
+flow.json itself now hits the /devices/... paths.
 
 Write paths into the underlying tables are intentionally excluded from
 this router: telemetry/score/alert/crash/status rows are written
@@ -126,16 +128,15 @@ class TelemetryOut(BaseModel):
 class ScoreOut(BaseModel):
     """
     Dashboard-compatible score payload. dashboard/flow.json's
-    'Format Safety Score' function node reads msg.payload.safety_score
-    and msg.payload.rating, so those keys are synthesized here from the
-    real 'score' column rather than renaming the column itself (the
-    firmware/backend on-the-wire field is legitimately called "score";
-    only this HTTP response shapes it for the existing dashboard).
+    'Format Safety Score' function node reads msg.payload.score and
+    msg.payload.rating directly, so this response uses the same field
+    name as the underlying ScoreRecord.score column - no renaming - plus
+    the server-computed 'rating' bucket the dashboard also expects.
     """
 
     device_id: str
     timestamp_ms: int
-    safety_score: float
+    score: float
     rating: str
     harsh_braking_count: int
     harsh_accel_count: int
@@ -149,14 +150,18 @@ class ScoreOut(BaseModel):
 class AlertOut(BaseModel):
     """
     Dashboard-compatible alert payload. dashboard/flow.json's
-    'Format Alerts Table' function node reads item.timestamp,
-    item.alert_type, item.severity, item.message - none of which exist
-    as columns on AlertRecord (which stores alert_type plus a raw JSON
-    blob), so severity/message are derived here.
+    'Format Alerts Table' function node reads item.timestamp_ms,
+    item.alert_type, item.latitude_deg, item.longitude_deg, and
+    item.raw_payload_json (rendered into the "Details" column) - so
+    those are the field names used here, matching AlertRecord's own
+    columns 1:1. severity/message are kept as additional derived fields
+    for any other consumer that wants a human-readable summary, but the
+    dashboard itself does not read them.
     """
 
-    timestamp: int
+    timestamp_ms: int
     alert_type: str
+    raw_payload_json: str
     severity: str
     message: str
     latitude_deg: Optional[float] = None
@@ -374,7 +379,13 @@ def get_device_latest_telemetry(
 # parameter is a device_id, not a separate driver entity (see module
 # docstring).
 # --------------------------------------------------------------------------
-@router.get("/drivers/{device_id}/score", response_model=ScoreOut, tags=["scores"])
+@router.get("/devices/{device_id}/score", response_model=ScoreOut, tags=["scores"])
+@router.get(
+    "/drivers/{device_id}/score",
+    response_model=ScoreOut,
+    tags=["scores"],
+    include_in_schema=False,  # legacy alias, kept for backward compatibility
+)
 def get_latest_score(device_id: str, db: Session = Depends(get_db)) -> ScoreOut:
     """Returns the most recent safety score for a device, shaped for
     dashboard/flow.json's gauge and rating text widgets."""
@@ -395,7 +406,7 @@ def get_latest_score(device_id: str, db: Session = Depends(get_db)) -> ScoreOut:
         return ScoreOut(
             device_id=record.device_id,
             timestamp_ms=record.timestamp_ms,
-            safety_score=record.score,
+            score=record.score,
             rating=_rating_for_score(record.score),
             harsh_braking_count=record.harsh_braking_count,
             harsh_accel_count=record.harsh_accel_count,
@@ -438,7 +449,7 @@ def get_score_history(
             ScoreOut(
                 device_id=r.device_id,
                 timestamp_ms=r.timestamp_ms,
-                safety_score=r.score,
+                score=r.score,
                 rating=_rating_for_score(r.score),
                 harsh_braking_count=r.harsh_braking_count,
                 harsh_accel_count=r.harsh_accel_count,
@@ -460,7 +471,13 @@ def get_score_history(
 # Also kept under /drivers/... for the same dashboard-compatibility
 # reason as the score route above.
 # --------------------------------------------------------------------------
-@router.get("/drivers/{device_id}/alerts", response_model=List[AlertOut], tags=["alerts"])
+@router.get("/devices/{device_id}/alerts", response_model=List[AlertOut], tags=["alerts"])
+@router.get(
+    "/drivers/{device_id}/alerts",
+    response_model=List[AlertOut],
+    tags=["alerts"],
+    include_in_schema=False,  # legacy alias, kept for backward compatibility
+)
 def get_device_alerts(
     device_id: str,
     limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
@@ -486,8 +503,9 @@ def get_device_alerts(
             severity, message = _severity_and_message_for_alert(r)
             result.append(
                 AlertOut(
-                    timestamp=r.timestamp_ms,
+                    timestamp_ms=r.timestamp_ms,
                     alert_type=r.alert_type,
+                    raw_payload_json=r.raw_payload_json,
                     severity=severity,
                     message=message,
                     latitude_deg=r.latitude_deg,
@@ -526,8 +544,9 @@ def list_alerts(
             severity, message = _severity_and_message_for_alert(r)
             result.append(
                 AlertOut(
-                    timestamp=r.timestamp_ms,
+                    timestamp_ms=r.timestamp_ms,
                     alert_type=r.alert_type,
+                    raw_payload_json=r.raw_payload_json,
                     severity=severity,
                     message=message,
                     latitude_deg=r.latitude_deg,
