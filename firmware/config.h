@@ -97,7 +97,7 @@ extern "C" {
 #define OBD_TWAI_RX_GPIO                5
 #define OBD_CAN_BITRATE_BPS             500000  /* Standard OBD-II CAN speed */
 #define OBD_SAMPLE_PERIOD_MS            500     /* 2 Hz */
-#define OBD_REQUEST_TIMEOUT_MS          100
+#define OBD_REQUEST_TIMEOUT_MS          400
 #define OBD_RESPONSE_QUEUE_LEN          5
 
 /* Standard OBD-II Mode 01 PIDs used by this system */
@@ -105,6 +105,13 @@ extern "C" {
 #define OBD_PID_VEHICLE_SPEED           0x0D
 #define OBD_PID_THROTTLE_POSITION       0x11
 #define OBD_PID_ENGINE_COOLANT_TEMP     0x05
+
+/* Bluetooth Classic SPP link to an ELM327-compatible OBD-II dongle
+ * (see obd.c's header comment) */
+#define OBD_BT_TARGET_MAC              { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }  /* replace with your dongle's MAC */
+#define OBD_BT_SPP_SCN                 1
+#define OBD_BT_CONNECT_TIMEOUT_MS      10000
+#define OBD_BT_RECONNECT_DELAY_MS      5000
 
 /* ---------------------------------------------------------------------------
  * Task Priorities
