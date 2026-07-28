@@ -17,8 +17,8 @@
  * needed both for the MQTT client ID and for every topic string.
  * ========================================================================= */
 
-#ifndef MQTT_CLIENT_H
-#define MQTT_CLIENT_H
+#ifndef DBAS_MQTT_CLIENT_H
+#define DBAS_MQTT_CLIENT_H
 
 #include <stdint.h>
 #include <stdbool.h>
