@@ -40,8 +40,8 @@ extern "C" {
  * defined here as macros to keep this reference implementation
  * self-contained and fully compilable out of the box.
  * ------------------------------------------------------------------------- */
-#define WIFI_SSID                      "C-1006"
-#define WIFI_PASSWORD                  "duc@tiM796"
+#define WIFI_SSID                      "WifiName"
+#define WIFI_PASSWORD                  "WifiPass"
 #define WIFI_MAX_RETRY_COUNT           10
 #define WIFI_RECONNECT_DELAY_MS        5000
 #define WIFI_CONNECT_TIMEOUT_MS        15000
