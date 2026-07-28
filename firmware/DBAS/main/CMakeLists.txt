@@ -1,0 +1,29 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "app_main.c"
+        "task_manager.c"
+        "wifi_manager.c"
+	"dbas_mqtt_client.c"
+        "sensor_manager.c"
+        "driver_score.c"
+        "crash_detection.c"
+        "idling_detection.c"
+        "geofence.c"
+        "gps.c"
+        "mpu6050.c"
+        "obd.c"
+
+    INCLUDE_DIRS
+        "."
+
+    REQUIRES
+        esp_wifi
+        esp_event
+        nvs_flash
+        mqtt
+        driver
+        esp_timer
+        bt
+        cjson
+)
