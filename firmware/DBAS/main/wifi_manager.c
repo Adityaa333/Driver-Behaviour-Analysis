@@ -12,7 +12,6 @@
  * ========================================================================= */
 
 #include <string.h>
-#include <inttypes.h>
 #include "wifi_manager.h"
 #include "config.h"
 #include "esp_wifi.h"
@@ -23,6 +22,7 @@
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include <inttypes.h>
 
 static const char *TAG = "wifi_manager";
 

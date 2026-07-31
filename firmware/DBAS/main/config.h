@@ -26,7 +26,7 @@ extern "C" {
  * Firmware Identification
  * ------------------------------------------------------------------------- */
 #define FIRMWARE_VERSION_MAJOR         1
-#define FIRMWARE_VERSION_MINOR         0
+#define FIRMWARE_VERSION_MINOR         1
 #define FIRMWARE_VERSION_PATCH         0
 #define DEVICE_TYPE_STRING             "DBAS-ESP32"
 #define DEVICE_ID_MAX_LEN              32   /* Derived from MAC at runtime */

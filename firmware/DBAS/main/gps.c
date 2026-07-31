@@ -108,21 +108,37 @@ static bool nmea_checksum_valid(const char *sentence)
 }
 
 /**
+ * @brief Split a NUL-terminated, comma-delimited NMEA sentence into
+ *        fields, preserving empty fields. strtok_r cannot be used here:
+ *        it merges consecutive delimiters and silently drops empty
+ *        tokens, which is fatal for NMEA since sentences routinely
+ *        contain empty fields (e.g. no fix yet, no altitude) at fixed
+ *        field positions the parser depends on.
+ */
+static int nmea_split_fields(char *sentence, char *fields[], int max_fields)
+{
+    int count = 0;
+    char *p = sentence;
+    fields[count++] = p;
+    while (*p != '\0' && count < max_fields) {
+        if (*p == ',' || *p == '*') {
+            *p = '\0';
+            fields[count++] = p + 1;
+        }
+        p++;
+    }
+    return count;
+}
+
+/**
  * @brief Parse an RMC sentence and update working/latest fix state.
  *        Expects a mutable, NUL-terminated copy of the sentence.
  */
 static void gps_parse_rmc(char *sentence)
 {
     /* Field layout: $--RMC,time,status,lat,NS,lon,EW,speed,course,date,... */
-    char *saveptr = NULL;
     char *fields[12] = { NULL };
-    int count = 0;
-
-    char *tok = strtok_r(sentence, ",", &saveptr);
-    while (tok != NULL && count < 12) {
-        fields[count++] = tok;
-        tok = strtok_r(NULL, ",", &saveptr);
-    }
+    int count = nmea_split_fields(sentence, fields, 12);
 
     if (count < 9) {
         ESP_LOGW(TAG, "RMC sentence has too few fields (%d), discarding", count);
@@ -171,15 +187,8 @@ static void gps_parse_gga(char *sentence)
 {
     /* Field layout:
      * $--GGA,time,lat,NS,lon,EW,fixquality,numSV,HDOP,alt,M,... */
-    char *saveptr = NULL;
     char *fields[10] = { NULL };
-    int count = 0;
-
-    char *tok = strtok_r(sentence, ",", &saveptr);
-    while (tok != NULL && count < 10) {
-        fields[count++] = tok;
-        tok = strtok_r(NULL, ",", &saveptr);
-    }
+    int count = nmea_split_fields(sentence, fields, 10);
 
     if (count < 10) {
         ESP_LOGW(TAG, "GGA sentence has too few fields (%d), discarding", count);
@@ -258,13 +267,14 @@ static void gps_uart_task(void *arg)
         if (byte == '\n') {
             if (line_len > 0) {
                 line[line_len] = '\0';
+                ESP_LOGD(TAG, "RAW: %s", line);   // once per sentence, debug level
                 if (line[0] == '$') {
                     gps_parse_sentence(line);
                 }
                 line_len = 0;
             }
-            continue;
-        }
+        continue;
+}
 
         if (line_len < (sizeof(line) - 1)) {
             line[line_len++] = (char)byte;

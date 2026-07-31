@@ -31,6 +31,7 @@ static const char *TAG = "mpu6050";
 #define MPU6050_REG_WHO_AM_I           0x75
 
 #define MPU6050_WHO_AM_I_VALUE         0x68
+#define MPU6500_WHO_AM_I_VALUE         0x70
 
 /* Configuration values selected to fix the full-scale ranges documented
  * in mpu6050.h: +/-8g accelerometer, +/-500 deg/s gyroscope. */
@@ -178,7 +179,19 @@ esp_err_t mpu6050_init(void)
         return ESP_ERR_TIMEOUT;
     }
 
-    /* Verify device identity before touching configuration registers. */
+/* Verify device identity before touching configuration registers.
+     *
+     * MPU6500_WHO_AM_I_VALUE is accepted alongside the genuine MPU6050
+     * ID because many boards labeled "MPU-6050" actually
+     * carry an MPU6500 die - the two are pin and register-compatible
+     * for the init/read sequence this driver uses, so treating 0x70 as
+     * valid lets development continue without hardware changes. This is
+     * a stopgap: MPU6500 has different noise/bias characteristics than
+     * a genuine MPU6050, and this system's crash thresholds
+     * (THRESHOLD_CRASH_ACCEL_G/DPS in config.h) were chosen with an
+     * MPU6050 in mind. Replace with a verified MPU6050 before relying
+     * on this for real safety-critical deployment. 
+*/
     uint8_t who_am_i = 0;
     err = mpu6050_read_regs_locked(MPU6050_REG_WHO_AM_I, &who_am_i, 1);
     if (err != ESP_OK) {
@@ -186,11 +199,16 @@ esp_err_t mpu6050_init(void)
         ESP_LOGE(TAG, "WHO_AM_I read failed: %s", esp_err_to_name(err));
         return err;
     }
-    if (who_am_i != MPU6050_WHO_AM_I_VALUE) {
+    if (who_am_i != MPU6050_WHO_AM_I_VALUE && who_am_i != MPU6500_WHO_AM_I_VALUE) {
         xSemaphoreGive(s_i2c_mutex);
-        ESP_LOGE(TAG, "Unexpected WHO_AM_I: 0x%02X (expected 0x%02X)",
-                 who_am_i, MPU6050_WHO_AM_I_VALUE);
+        ESP_LOGE(TAG, "Unexpected WHO_AM_I: 0x%02X (expected 0x%02X or 0x%02X)",
+                 who_am_i, MPU6050_WHO_AM_I_VALUE, MPU6500_WHO_AM_I_VALUE);
         return ESP_ERR_NOT_FOUND;
+    }
+    if (who_am_i == MPU6500_WHO_AM_I_VALUE) {
+        ESP_LOGW(TAG, "Detected MPU6500 die (WHO_AM_I=0x70) on a board expected to be "
+                 "MPU6050 - proceeding with MPU6050 register sequence, but replace with "
+                 "a genuine MPU6050 before relying on this for safety-critical operation");
     }
 
     /* Wake the device from sleep and select the gyro X PLL as clock source
