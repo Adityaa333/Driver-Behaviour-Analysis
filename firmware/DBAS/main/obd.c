@@ -1,49 +1,45 @@
 // Design notes:
-
-// This version replaces the TWAI/CAN transport with a Bluetooth Classic
-// SPP link to an ELM327-compatible OBD-II dongle. The public contract in
-// obd.h (obd_data_t, obd_init(), obd_read()) is UNCHANGED so sensor_manager.c
+//
+// This version replaces the Bluetooth Classic SPP transport with a BLE
+// GATT client built on NimBLE, targeting a "UART-over-BLE" ELM327 clone:
+// service FFF0, notify characteristic FFF1 (dongle -> us), write
+// characteristic FFF2 (us -> dongle). The public contract in obd.h
+// (obd_data_t, obd_init(), obd_read()) is UNCHANGED, so sensor_manager.c
 // and everything downstream of it needs no modification at all.
 //
-// Requires the following new macros in config.h (not shown here):
-//   OBD_BT_TARGET_MAC        - 6-byte esp_bd_addr_t of the paired dongle
-//   OBD_BT_SPP_SCN           - remote SPP server channel number. Many
-//                              cheap ELM327 clones fix this at 1; if yours
-//                              doesn't, run an SDP discovery once during
-//                              bring-up to find the real channel and hard
-//                              code it here.
-//   OBD_BT_CONNECT_TIMEOUT_MS
-//   OBD_BT_RECONNECT_DELAY_MS
-//   OBD_REQUEST_TIMEOUT_MS   - must be raised from the CAN-era 100ms;
-//                              Bluetooth SPP round trips are far slower.
-//                              300-500ms is a more realistic starting point.
+// NimBLE (not Bluedroid) is used specifically for compile size: Bluedroid
+// links the full Classic+BLE dual-mode stack regardless of which role you
+// actually use, while NimBLE is ESP-IDF's BLE-only host. Getting the real
+// flash/RAM savings also requires sdkconfig changes (BLE-only controller
+// mode, NimBLE selected as the host stack, central role only, unused
+// NimBLE features disabled) - see the accompanying config.h/sdkconfig
+// notes; the component choice alone doesn't shrink anything.
 //
-// A single background task (obd_bt_connection_task) owns the SPP
-// connection lifecycle: it connects at startup and reconnects
-// automatically (bounded retry + backoff, mirroring wifi_manager.c's
-// approach) whenever the link drops - a Bluetooth link to a dongle
-// riding around in a vehicle will drop, and this module must recover
-// without requiring a device reboot.
+// Everything here runs as a NimBLE *central/GATT-client* - this device
+// never advertises or accepts inbound connections, so no GAP/GATT server
+// setup (ble_svc_gap, ble_svc_gatt) is needed, which is itself a modest
+// additional size/RAM saving over a general-purpose BLE template.
 //
-// Bytes arriving from the dongle are pushed onto a FreeRTOS queue by the
-// SPP data-indication callback (which runs in the Bluedroid callback
+// A single background task (obd_ble_connection_task) owns the connection
+// lifecycle end-to-end: connect, discover FFF0, discover FFF1/FFF2,
+// discover FFF1's CCCD descriptor, subscribe, run the ELM327 AT setup
+// sequence, then idle - and starts over from the top on any disconnect.
+// This mirrors wifi_manager.c's and the old obd_bt_connection_task's
+// "never give up, recover without a reboot" philosophy.
+//
+// Bytes arriving via BLE notifications on FFF1 are pushed onto a FreeRTOS
+// queue by the GAP event callback (which runs in the NimBLE host task's
 // context, not our own task) and consumed by whichever task is currently
-// waiting on a command's response inside obd_request_pid_locked(). Only
-// one request is ever in flight at a time, enforced by s_bus_mutex - this
-// plays the same role s_bus_mutex played in the CAN version.
+// waiting on a command's response inside
+// obd_read_response_until_prompt_locked(). Only one request is ever in
+// flight at a time, enforced by s_bus_mutex - the same role it played in
+// both earlier (CAN and SPP) versions of this file.
 // ============================================================================
 
 /* ============================================================================
  * obd.c
  *
- * Implementation of the OBD-II driver declared in obd.h, using a
- * Bluetooth Classic SPP connection to an ELM327-compatible dongle
- * instead of a directly-wired CAN transceiver.
- *
- * ELM327 "AT" commands and Mode 01 PID requests are plain ASCII text
- * terminated by '\r'; responses are ASCII hex terminated by a '>' prompt
- * character. This module hides all of that framing/parsing behind the
- * same obd_read() contract the rest of the firmware already depends on.
+ * Implementation of the OBD-II driver declared in obd.h.
  * ========================================================================= */
 
 #include <string.h>
@@ -51,52 +47,317 @@
 #include <ctype.h>
 #include "obd.h"
 #include "config.h"
-#include "esp_bt.h"
-#include "esp_bt_main.h"
-#include "esp_bt_device.h"
-#include "esp_gap_bt_api.h"
-#include "esp_spp_api.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
+#include "freertos/event_groups.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/util/util.h"
+#include "host/ble_uuid.h"
+
 static const char *TAG = "obd";
 
-#define OBD_RX_QUEUE_LEN            32     /* SPP data chunks buffered */
-#define OBD_RX_CHUNK_MAX_LEN        128    /* Max bytes per queued chunk */
+#define OBD_RX_QUEUE_LEN            32     /* Notification chunks buffered */
+#define OBD_RX_CHUNK_MAX_LEN        247    /* Max ATT payload after MTU exchange */
 #define OBD_RESPONSE_BUF_LEN        256    /* Accumulated ASCII response */
 #define OBD_AT_RETRY_COUNT          3
+#define OBD_DESIRED_ATT_MTU         185    /* Comfortably fits one ELM327 line */
+
+/* GATT layer for the "UART bridge" service exposed by the dongle
+ * (see ble_scanner log: services=["1804","180F","FFF0","AE30","AE3A"],
+ * FFF0 chars = FFF1[Read Notify], FFF2[Write]). 1804/180F/AE30/AE3A are
+ * standard/vendor services unrelated to the OBD data path and are
+ * ignored entirely - we only ever discover FFF0 by UUID. */
+static const ble_uuid16_t s_svc_uuid          = BLE_UUID16_INIT(0xFFF0);
+static const ble_uuid16_t s_chr_notify_uuid   = BLE_UUID16_INIT(0xFFF1);
+static const ble_uuid16_t s_chr_write_uuid    = BLE_UUID16_INIT(0xFFF2);
+static const ble_uuid16_t s_dsc_cccd_uuid     = BLE_UUID16_INIT(0x2902);
 
 typedef struct {
     uint8_t data[OBD_RX_CHUNK_MAX_LEN];
     uint16_t len;
 } obd_rx_chunk_t;
 
-static SemaphoreHandle_t s_bus_mutex = NULL;   /* Serializes one request at a time */
-static QueueHandle_t s_rx_queue = NULL;        /* SPP callback -> waiting task */
+/* Connection/discovery state machine. Advanced only from the NimBLE
+ * host task's callback context; read from obd_ble_connection_task and
+ * obd_read() via the volatile qualifier rather than a mutex, since it's
+ * a single word and only ever monotonically progresses forward before
+ * being reset to DISCONNECTED on any failure/disconnect. */
+typedef enum {
+    OBD_BLE_STATE_DISCONNECTED = 0,
+    OBD_BLE_STATE_CONNECTING,
+    OBD_BLE_STATE_DISCOVERING,
+    OBD_BLE_STATE_SUBSCRIBED,   /* GATT-ready; ELM327 AT setup not yet run */
+    OBD_BLE_STATE_READY,        /* Subscribed AND ELM327 setup completed */
+} obd_ble_state_t;
 
-static uint32_t s_spp_handle = 0;
-static volatile bool s_spp_connected = false;
-static volatile bool s_elm327_configured = false;
+#define OBD_EVENT_HOST_SYNCED       (1 << 0)
+#define OBD_EVENT_DISCOVERY_DONE    (1 << 1)
+#define OBD_EVENT_DISCOVERY_FAILED  (1 << 2)
+
+static volatile obd_ble_state_t s_state = OBD_BLE_STATE_DISCONNECTED;
+static SemaphoreHandle_t s_bus_mutex = NULL;   /* Serializes one request at a time */
+static QueueHandle_t s_rx_queue = NULL;        /* GAP notify callback -> waiting task */
+static EventGroupHandle_t s_event_group = NULL;
+
+static uint8_t s_own_addr_type;
+static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t s_svc_start_handle;
+static uint16_t s_svc_end_handle;
+static uint16_t s_notify_val_handle;
+static uint16_t s_write_val_handle;
+static uint16_t s_cccd_handle;
+
+static const ble_addr_t s_target_addr = {
+    .type = OBD_BLE_TARGET_ADDR_TYPE,
+    .val  = OBD_BT_TARGET_MAC,
+};
+
 static bool s_initialized = false;
 
-static const esp_bd_addr_t s_target_addr = OBD_BT_TARGET_MAC;
+/* ---------------------------------------------------------------------------
+ * Forward Declarations
+ * ------------------------------------------------------------------------- */
+static int ble_gap_event_cb(struct ble_gap_event *event, void *arg);
+static void obd_ble_connection_task(void *arg);
 
 /* ---------------------------------------------------------------------------
- * SPP Response Reading
+ * GATT Discovery Chain
+ *
+ * Each step kicks off the next from inside its own completion callback,
+ * since NimBLE discovery is inherently async/one-shot per call. On any
+ * failure, discovery is abandoned and OBD_EVENT_DISCOVERY_FAILED is set;
+ * obd_ble_connection_task then tears down the connection and retries
+ * from scratch rather than trying to resume a partial discovery.
  * ------------------------------------------------------------------------- */
 
-/**
- * @brief Drain the RX queue, accumulating bytes into out_buf until a '>'
- *        prompt character is seen (ELM327's end-of-response marker) or
- *        the timeout elapses. Caller must hold s_bus_mutex.
+static int on_cccd_write(uint16_t conn_handle, const struct ble_gatt_error *error,
+                          struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn_handle;
+    (void)attr;
+    (void)arg;
+
+    if (error->status != 0) {
+        ESP_LOGE(TAG, "CCCD write failed, status=%d", error->status);
+        xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+        return 0;
+    }
+
+    ESP_LOGI(TAG, "Subscribed to FFF1 notifications");
+    s_state = OBD_BLE_STATE_SUBSCRIBED;
+    xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_DONE);
+    return 0;
+}
+
+static int on_dsc_disc(uint16_t conn_handle, const struct ble_gatt_error *error,
+                        uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
+{
+    (void)arg;
+    (void)chr_val_handle;
+
+    if (error->status == 0 && dsc != NULL &&
+        ble_uuid_cmp(&dsc->uuid.u, &s_dsc_cccd_uuid.u) == 0) {
+        s_cccd_handle = dsc->handle;
+        return 0; /* Keep discovering in case of duplicate/other descriptors */
+    }
+
+    if (error->status == BLE_HS_EDONE) {
+        if (s_cccd_handle == 0) {
+            ESP_LOGE(TAG, "FFF1 has no CCCD (0x2902) descriptor - cannot subscribe");
+            xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+            return 0;
+        }
+        /* Notifications (not indications): write 0x0001 little-endian. */
+        uint8_t notify_on[2] = { 0x01, 0x00 };
+        int rc = ble_gattc_write_flat(conn_handle, s_cccd_handle,
+                                       notify_on, sizeof(notify_on),
+                                       on_cccd_write, NULL);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "ble_gattc_write_flat(CCCD) failed, rc=%d", rc);
+            xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+        }
+        return 0;
+    }
+
+    if (error->status != 0 && error->status != BLE_HS_EDONE) {
+        ESP_LOGE(TAG, "Descriptor discovery failed, status=%d", error->status);
+        xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+    }
+    return 0;
+}
+
+static int on_chr_write_disc(uint16_t conn_handle, const struct ble_gatt_error *error,
+                              const struct ble_gatt_chr *chr, void *arg)
+{
+    (void)arg;
+
+    if (error->status != 0 || chr == NULL) {
+        ESP_LOGE(TAG, "FFF2 (write) characteristic not found, status=%d", error->status);
+        xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+        return 0;
+    }
+
+    s_write_val_handle = chr->val_handle;
+    ESP_LOGI(TAG, "Discovered FFF2 (write) at handle %d", s_write_val_handle);
+
+    /* Next: find FFF1's CCCD descriptor so we can subscribe. Descriptors
+     * live between FFF1's value handle and the end of the service. */
+    int rc = ble_gattc_disc_all_dscs(conn_handle, s_notify_val_handle + 1,
+                                      s_svc_end_handle, on_dsc_disc, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gattc_disc_all_dscs failed, rc=%d", rc);
+        xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+    }
+    return 0;
+}
+
+static int on_chr_notify_disc(uint16_t conn_handle, const struct ble_gatt_error *error,
+                               const struct ble_gatt_chr *chr, void *arg)
+{
+    (void)arg;
+
+    if (error->status != 0 || chr == NULL) {
+        ESP_LOGE(TAG, "FFF1 (notify) characteristic not found, status=%d", error->status);
+        xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+        return 0;
+    }
+
+    s_notify_val_handle = chr->val_handle;
+    ESP_LOGI(TAG, "Discovered FFF1 (notify) at handle %d", s_notify_val_handle);
+
+    /* Next: FFF2 (write). Searching the whole service range again is
+     * fine - NimBLE only returns handles inside [start,end]. */
+    int rc = ble_gattc_disc_chrs_by_uuid(conn_handle, s_svc_start_handle, s_svc_end_handle,
+                                          &s_chr_write_uuid.u, on_chr_write_disc, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gattc_disc_chrs_by_uuid(FFF2) failed, rc=%d", rc);
+        xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+    }
+    return 0;
+}
+
+static int on_svc_disc(uint16_t conn_handle, const struct ble_gatt_error *error,
+                        const struct ble_gatt_svc *service, void *arg)
+{
+    (void)arg;
+
+    if (error->status != 0 || service == NULL) {
+        ESP_LOGE(TAG, "FFF0 service not found, status=%d", error->status);
+        xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+        return 0;
+    }
+
+    s_svc_start_handle = service->start_handle;
+    s_svc_end_handle = service->end_handle;
+    s_cccd_handle = 0;
+    ESP_LOGI(TAG, "Discovered FFF0 service, handles [%d,%d]",
+             s_svc_start_handle, s_svc_end_handle);
+
+    int rc = ble_gattc_disc_chrs_by_uuid(conn_handle, s_svc_start_handle, s_svc_end_handle,
+                                          &s_chr_notify_uuid.u, on_chr_notify_disc, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gattc_disc_chrs_by_uuid(FFF1) failed, rc=%d", rc);
+        xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * GAP Event Handling (connect/disconnect/notify/MTU)
  *
- * @return ESP_OK if a full response (terminated by '>') was captured,
- *         ESP_ERR_TIMEOUT otherwise.
- */
+ * NimBLE delivers incoming notifications through this same GAP callback
+ * (BLE_GAP_EVENT_NOTIFY_RX) rather than a separate GATT subscription
+ * callback - there is no dedicated "data indication" callback to
+ * register, unlike the SPP version's ESP_SPP_DATA_IND_EVT.
+ * ------------------------------------------------------------------------- */
+
+static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+
+    switch (event->type) {
+        case BLE_GAP_EVENT_CONNECT:
+            if (event->connect.status != 0) {
+                ESP_LOGW(TAG, "Connection attempt failed, status=%d", event->connect.status);
+                s_state = OBD_BLE_STATE_DISCONNECTED;
+                xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+                return 0;
+            }
+
+            ESP_LOGI(TAG, "Connected to OBD dongle, conn_handle=%d", event->connect.conn_handle);
+            s_conn_handle = event->connect.conn_handle;
+            s_state = OBD_BLE_STATE_DISCOVERING;
+
+            /* Best-effort: a larger ATT MTU means fewer notification
+             * fragments per ELM327 response line. obd_read_response_
+             * until_prompt_locked() reassembles fragments regardless, so
+             * this is a latency/efficiency optimization, not a
+             * correctness requirement - no need to wait for its result
+             * before starting service discovery. */
+            ble_gattc_exchange_mtu(s_conn_handle, NULL, NULL);
+
+            {
+                int rc = ble_gattc_disc_svc_by_uuid(s_conn_handle, &s_svc_uuid.u,
+                                                     on_svc_disc, NULL);
+                if (rc != 0) {
+                    ESP_LOGE(TAG, "ble_gattc_disc_svc_by_uuid failed, rc=%d", rc);
+                    xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+                }
+            }
+            return 0;
+
+        case BLE_GAP_EVENT_DISCONNECT:
+            ESP_LOGW(TAG, "Disconnected from OBD dongle, reason=%d",
+                     event->disconnect.reason);
+            s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            s_state = OBD_BLE_STATE_DISCONNECTED;
+            /* Unblock anything waiting in obd_read_response_until_prompt_
+             * locked() rather than leaving it to time out. */
+            xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+            return 0;
+
+        case BLE_GAP_EVENT_NOTIFY_RX: {
+            /* Runs in the NimBLE host task's context - keep this fast
+             * and non-blocking; just hand the bytes off to whichever
+             * task is waiting inside obd_read_response_until_prompt_
+             * locked(). */
+            if (event->notify_rx.attr_handle != s_notify_val_handle) {
+                return 0; /* Not our characteristic (shouldn't happen) */
+            }
+
+            obd_rx_chunk_t chunk;
+            uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
+            if (len > OBD_RX_CHUNK_MAX_LEN) {
+                len = OBD_RX_CHUNK_MAX_LEN;
+            }
+            os_mbuf_copydata(event->notify_rx.om, 0, len, chunk.data);
+            chunk.len = len;
+
+            if (xQueueSend(s_rx_queue, &chunk, 0) != pdTRUE) {
+                ESP_LOGW(TAG, "OBD RX queue full, dropping notification chunk");
+            }
+            return 0;
+        }
+
+        default:
+            return 0;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * SPP-era response reading logic, adapted to pull from BLE notification
+ * chunks instead of SPP data-indication chunks. Framing (ASCII, '\r'
+ * terminated commands, '>' terminated responses) is identical since the
+ * dongle firmware's ELM327 emulation doesn't change with transport.
+ * ------------------------------------------------------------------------- */
+
 static esp_err_t obd_read_response_until_prompt_locked(char *out_buf, size_t out_buf_len,
                                                         uint32_t timeout_ms)
 {
@@ -106,6 +367,10 @@ static esp_err_t obd_read_response_until_prompt_locked(char *out_buf, size_t out
     int64_t deadline_us = esp_timer_get_time() + ((int64_t)timeout_ms * 1000);
 
     for (;;) {
+        if (s_state != OBD_BLE_STATE_READY) {
+            return ESP_ERR_INVALID_STATE; /* Disconnected mid-request */
+        }
+
         int64_t remaining_ms = (deadline_us - esp_timer_get_time()) / 1000;
         if (remaining_ms <= 0) {
             ESP_LOGW(TAG, "Timed out waiting for ELM327 prompt");
@@ -114,7 +379,7 @@ static esp_err_t obd_read_response_until_prompt_locked(char *out_buf, size_t out
 
         obd_rx_chunk_t chunk;
         if (xQueueReceive(s_rx_queue, &chunk, pdMS_TO_TICKS(remaining_ms)) != pdTRUE) {
-            continue; /* Loop re-checks the overall deadline */
+            continue; /* Loop re-checks the overall deadline/connection state */
         }
 
         for (uint16_t i = 0; i < chunk.len && written < (out_buf_len - 1); i++) {
@@ -127,29 +392,25 @@ static esp_err_t obd_read_response_until_prompt_locked(char *out_buf, size_t out
     }
 }
 
-/**
- * @brief Send a raw ASCII command (already including its trailing '\r')
- *        to the connected dongle and wait for the '>' terminated
- *        response. Caller must hold s_bus_mutex.
- */
 static esp_err_t obd_send_command_locked(const char *cmd, char *resp_buf, size_t resp_buf_len,
                                           uint32_t timeout_ms)
 {
-    if (!s_spp_connected) {
+    if (s_state != OBD_BLE_STATE_READY) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Drain any stale bytes left over from a previous exchange (e.g. a
-     * late duplicate response) before sending a new command, so they
-     * can't be misread as part of this command's response. */
+    /* Drain any stale bytes left over from a previous exchange before
+     * sending a new command, so they can't be misread as part of this
+     * command's response. */
     obd_rx_chunk_t stale;
     while (xQueueReceive(s_rx_queue, &stale, 0) == pdTRUE) {
         /* discard */
     }
 
-    esp_err_t err = esp_spp_write(s_spp_handle, (int)strlen(cmd), (uint8_t *)cmd);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "esp_spp_write failed for command \"%s\": %s", cmd, esp_err_to_name(err));
+    int rc = ble_gattc_write_no_rsp_flat(s_conn_handle, s_write_val_handle,
+                                          cmd, (uint16_t)strlen(cmd));
+    if (rc != 0) {
+        ESP_LOGW(TAG, "ble_gattc_write_no_rsp_flat failed for command \"%s\", rc=%d", cmd, rc);
         return ESP_ERR_TIMEOUT;
     }
 
@@ -157,14 +418,10 @@ static esp_err_t obd_send_command_locked(const char *cmd, char *resp_buf, size_t
 }
 
 /* ---------------------------------------------------------------------------
- * ELM327 Setup (AT Commands)
+ * ELM327 Setup (AT Commands) - unchanged from the SPP version; the
+ * dongle's ELM327 emulation is transport-agnostic.
  * ------------------------------------------------------------------------- */
 
-/**
- * @brief Run the standard ELM327 reset/configuration sequence after a
- *        fresh SPP connection: reset, echo off, linefeeds off, auto
- *        protocol select. Caller must hold s_bus_mutex.
- */
 static esp_err_t obd_elm327_configure_locked(void)
 {
     static const char *const setup_cmds[] = {
@@ -198,16 +455,10 @@ static esp_err_t obd_elm327_configure_locked(void)
 }
 
 /* ---------------------------------------------------------------------------
- * PID Request / Response Parsing
+ * PID Request / Response Parsing - byte-for-byte unchanged from the SPP
+ * version; ELM327 Mode 01 response framing doesn't depend on transport.
  * ------------------------------------------------------------------------- */
 
-/**
- * @brief Parse an ELM327 Mode 01 response line such as "41 0C 1A F8" into
- *        its data bytes. Tolerant of the "SEARCHING..." line some
- *        adapters prepend and of embedded whitespace/CR.
- *
- * @return true if a well-formed "41 <pid> ..." response was found.
- */
 static bool obd_parse_pid_response(const char *resp, uint8_t pid,
                                     uint8_t *out_byte_a, uint8_t *out_byte_b,
                                     bool *out_has_byte_b)
@@ -260,14 +511,10 @@ static bool obd_parse_pid_response(const char *resp, uint8_t pid,
     return true;
 }
 
-/**
- * @brief Request a single Mode 01 PID over the SPP link and parse its
- *        response. Caller must hold s_bus_mutex.
- */
 static esp_err_t obd_request_pid_locked(uint8_t pid, uint8_t *out_byte_a,
                                          uint8_t *out_byte_b, bool *out_has_byte_b)
 {
-    if (!s_spp_connected || !s_elm327_configured) {
+    if (s_state != OBD_BLE_STATE_READY) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -290,99 +537,222 @@ static esp_err_t obd_request_pid_locked(uint8_t pid, uint8_t *out_byte_a,
 }
 
 /* ---------------------------------------------------------------------------
- * SPP Event Handling
+ * NimBLE Host Callbacks
  * ------------------------------------------------------------------------- */
 
-static void obd_spp_callback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param)
+static void ble_on_reset(int reason)
 {
-    switch (event) {
-        case ESP_SPP_INIT_EVT:
-            ESP_LOGI(TAG, "SPP initialized");
-            break;
+    ESP_LOGW(TAG, "NimBLE host reset, reason=%d", reason);
+}
 
-        case ESP_SPP_OPEN_EVT:
-            ESP_LOGI(TAG, "SPP connection opened to OBD dongle");
-            s_spp_handle = param->open.handle;
-            s_spp_connected = true;
-            s_elm327_configured = false;
-            break;
-
-        case ESP_SPP_CLOSE_EVT:
-            ESP_LOGW(TAG, "SPP connection closed, will attempt reconnect");
-            s_spp_connected = false;
-            s_elm327_configured = false;
-            break;
-
-        case ESP_SPP_DATA_IND_EVT: {
-            /* Runs in the Bluedroid callback context - keep this fast
-             * and non-blocking; just hand the bytes off to whichever
-             * task is waiting inside obd_read_response_until_prompt_locked(). */
-            obd_rx_chunk_t chunk;
-            uint16_t len = param->data_ind.len;
-            if (len > OBD_RX_CHUNK_MAX_LEN) {
-                len = OBD_RX_CHUNK_MAX_LEN;
-            }
-            memcpy(chunk.data, param->data_ind.data, len);
-            chunk.len = len;
-            if (xQueueSend(s_rx_queue, &chunk, 0) != pdTRUE) {
-                ESP_LOGW(TAG, "OBD RX queue full, dropping data chunk");
-            }
-            break;
-        }
-
-        default:
-            break;
+static void ble_on_sync(void)
+{
+    /* Prefer a public address; ble_hs_id_infer_auto() falls back to
+     * whatever address type the controller actually has available. */
+    int rc = ble_hs_id_infer_auto(0, &s_own_addr_type);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_hs_id_infer_auto failed, rc=%d", rc);
+        return;
     }
+    xEventGroupSetBits(s_event_group, OBD_EVENT_HOST_SYNCED);
+}
+
+static void ble_host_task(void *param)
+{
+    (void)param;
+    nimble_port_run(); /* Returns only on nimble_port_stop() */
+    nimble_port_freertos_deinit();
 }
 
 /* ---------------------------------------------------------------------------
  * Connection Management Task
+ *
+ * Owns the complete BLE connection lifecycle:
+ *
+ *      Connect
+ *          ↓
+ *      Discover FFF0 Service
+ *          ↓
+ *      Discover FFF1 (Notify)
+ *          ↓
+ *      Discover FFF2 (Write)
+ *          ↓
+ *      Discover CCCD
+ *          ↓
+ *      Enable Notifications
+ *          ↓
+ *      Run ELM327 AT Setup
+ *          ↓
+ *      READY
+ *
+ * The task itself never performs service or characteristic discovery.
+ * Instead, it initiates the BLE connection and then waits for the
+ * asynchronous GAP/GATT callback chain to either complete successfully or
+ * report a failure. This separation keeps all BLE protocol handling inside
+ * the NimBLE host callbacks while this task simply manages the overall
+ * connection state machine.
+ *
+ * Any failure during connection, GATT discovery, notification
+ * subscription, AT-command initialization, or a later disconnect causes
+ * the driver to return to DISCONNECTED and restart the entire sequence
+ * after a short delay, mirroring the reconnect philosophy used by
+ * wifi_manager.c and the previous Bluetooth Classic implementation.
  * ------------------------------------------------------------------------- */
 
-/**
- * @brief Owns the connect/reconnect lifecycle: attempts an SPP connection
- *        to OBD_BT_TARGET_MAC, waits for it to come up, runs the ELM327
- *        setup sequence, then blocks until the link drops and repeats -
- *        indefinitely, so a mid-trip Bluetooth dropout recovers on its
- *        own without a reboot (mirroring wifi_manager.c's philosophy).
- */
-static void obd_bt_connection_task(void *arg)
+static void obd_ble_connection_task(void *arg)
 {
     (void)arg;
 
+    /* Wait until the NimBLE host has finished initialization and selected
+     * our own Bluetooth address. No connection attempts are made before
+     * the host reports it is fully synchronized. */
+    xEventGroupWaitBits(s_event_group,
+                        OBD_EVENT_HOST_SYNCED,
+                        pdFALSE,
+                        pdTRUE,
+                        portMAX_DELAY);
+
     for (;;) {
-        if (!s_spp_connected) {
-            ESP_LOGI(TAG, "Attempting SPP connection to OBD dongle");
-            esp_err_t err = esp_spp_connect(ESP_SPP_SEC_NONE, ESP_SPP_ROLE_MASTER,
-                                             OBD_BT_SPP_SCN, (uint8_t *)s_target_addr);
-            if (err != ESP_OK) {
-                ESP_LOGW(TAG, "esp_spp_connect failed: %s", esp_err_to_name(err));
-            }
 
-            /* Wait for ESP_SPP_OPEN_EVT (or the timeout) before deciding
-             * whether to configure the adapter or back off and retry. */
-            int64_t deadline_us = esp_timer_get_time() +
-                                   ((int64_t)OBD_BT_CONNECT_TIMEOUT_MS * 1000);
-            while (!s_spp_connected && esp_timer_get_time() < deadline_us) {
-                vTaskDelay(pdMS_TO_TICKS(100));
-            }
-        }
+        /* Clear any stale completion flags left from a previous
+         * connection attempt before starting a fresh connection cycle. */
+        xEventGroupClearBits(s_event_group,
+                             OBD_EVENT_DISCOVERY_DONE |
+                             OBD_EVENT_DISCOVERY_FAILED);
 
-        if (s_spp_connected && !s_elm327_configured) {
-            if (xSemaphoreTake(s_bus_mutex, pdMS_TO_TICKS(MUTEX_MAX_WAIT_MS)) == pdTRUE) {
-                esp_err_t err = obd_elm327_configure_locked();
-                s_elm327_configured = (err == ESP_OK);
-                xSemaphoreGive(s_bus_mutex);
-            }
-        }
+        ESP_LOGI(TAG, "Attempting BLE connection to OBD dongle");
+        s_state = OBD_BLE_STATE_CONNECTING;
 
-        if (!s_spp_connected) {
-            ESP_LOGW(TAG, "OBD dongle not connected, retrying in %d ms",
-                     OBD_BT_RECONNECT_DELAY_MS);
+        /* Connection parameters are intentionally conservative since the
+         * data rate required for ELM327 PID polling is very low. */
+        struct ble_gap_conn_params conn_params = { 0 };
+        conn_params.scan_itvl = 0x0010;
+        conn_params.scan_window = 0x0010;
+        conn_params.itvl_min = BLE_GAP_INITIAL_CONN_ITVL_MIN;
+        conn_params.itvl_max = BLE_GAP_INITIAL_CONN_ITVL_MAX;
+        conn_params.latency = 0;
+        conn_params.supervision_timeout = 0x0100;
+        conn_params.min_ce_len = 0x0010;
+        conn_params.max_ce_len = 0x0300;
+
+        /* Begin an asynchronous BLE connection attempt.
+         *
+         * A successful return from ble_gap_connect() does NOT mean that we
+         * are connected. It only means the controller accepted the request
+         * to begin connecting. The remainder of the process happens inside
+         * ble_gap_event_cb():
+         *
+         *      CONNECT
+         *          ↓
+         *      MTU Exchange
+         *          ↓
+         *      Discover FFF0
+         *          ↓
+         *      Discover FFF1
+         *          ↓
+         *      Discover FFF2
+         *          ↓
+         *      Discover CCCD
+         *          ↓
+         *      Enable Notifications
+         *
+         * If the connection cannot even be started (controller busy,
+         * invalid parameters, etc.), simply wait a short period and retry
+         * the entire connection sequence.
+         */
+        int rc = ble_gap_connect(s_own_addr_type,
+                                 &s_target_addr,
+                                 OBD_BT_CONNECT_TIMEOUT_MS,
+                                 &conn_params,
+                                 ble_gap_event_cb,
+                                 NULL);
+
+        if (rc != 0) {
+            ESP_LOGW(TAG,
+                     "ble_gap_connect failed to start, rc=%d",
+                     rc);
+
+            s_state = OBD_BLE_STATE_DISCONNECTED;
             vTaskDelay(pdMS_TO_TICKS(OBD_BT_RECONNECT_DELAY_MS));
-        } else {
-            /* Connected and configured; just idle-check periodically so
-             * a future disconnect is noticed and re-enters this loop. */
+            continue;
+        }
+
+        /* Connection establishment and the complete GATT discovery chain
+         * execute asynchronously inside the GAP/GATT callbacks. Rather
+         * than polling intermediate state, simply wait until one of two
+         * terminal events occurs:
+         *
+         *      OBD_EVENT_DISCOVERY_DONE
+         *          Complete connection + discovery + notification
+         *          subscription succeeded.
+         *
+         *      OBD_EVENT_DISCOVERY_FAILED
+         *          Connection failed, discovery failed, subscription
+         *          failed, or the peer disconnected before initialization
+         *          completed.
+         *
+         * The timeout intentionally exceeds the BLE connection timeout to
+         * provide sufficient time for the full multi-stage discovery
+         * process.
+         */
+        EventBits_t bits = xEventGroupWaitBits(
+            s_event_group,
+            OBD_EVENT_DISCOVERY_DONE |
+            OBD_EVENT_DISCOVERY_FAILED,
+            pdFALSE,
+            pdFALSE,
+            pdMS_TO_TICKS(OBD_BT_CONNECT_TIMEOUT_MS + 10000));
+
+        if (!(bits & OBD_EVENT_DISCOVERY_DONE)) {
+
+            ESP_LOGW(TAG,
+                     "Connect/discovery did not complete, retrying in %d ms",
+                     OBD_BT_RECONNECT_DELAY_MS);
+
+            /* If a partial connection still exists, explicitly terminate
+             * it before restarting the connection sequence. */
+            if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+                ble_gap_terminate(s_conn_handle,
+                                  BLE_ERR_REM_USER_CONN_TERM);
+            }
+
+            s_state = OBD_BLE_STATE_DISCONNECTED;
+            vTaskDelay(pdMS_TO_TICKS(OBD_BT_RECONNECT_DELAY_MS));
+            continue;
+        }
+
+        /* The BLE transport is now operational and notifications are
+         * enabled. Perform the ELM327 initialization sequence (ATZ,
+         * ATE0, ATL0, ATSP0) before allowing normal PID requests. */
+        if (xSemaphoreTake(s_bus_mutex,
+                           pdMS_TO_TICKS(MUTEX_MAX_WAIT_MS)) == pdTRUE) {
+
+            esp_err_t err = obd_elm327_configure_locked();
+
+            if (err == ESP_OK) {
+                s_state = OBD_BLE_STATE_READY;
+                ESP_LOGI(TAG, "OBD dongle ready");
+            } else {
+
+                ESP_LOGW(TAG,
+                         "ELM327 setup failed, disconnecting and retrying");
+
+                if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+                    ble_gap_terminate(s_conn_handle,
+                                      BLE_ERR_REM_USER_CONN_TERM);
+                }
+
+                s_state = OBD_BLE_STATE_DISCONNECTED;
+            }
+
+            xSemaphoreGive(s_bus_mutex);
+        }
+
+        /* Idle while the connection remains healthy. If the peer
+         * disconnects, BLE_GAP_EVENT_DISCONNECT asynchronously resets
+         * s_state to DISCONNECTED, causing this loop to exit and begin a
+         * fresh connection cycle automatically. */
+        while (s_state == OBD_BLE_STATE_READY) {
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
@@ -410,57 +780,35 @@ esp_err_t obd_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    esp_err_t err = esp_bt_controller_init(&bt_cfg);
+    s_event_group = xEventGroupCreate();
+    if (s_event_group == NULL) {
+        ESP_LOGE(TAG, "Failed to create OBD event group");
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t err = nimble_port_init();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_bt_controller_init failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "nimble_port_init failed: %s", esp_err_to_name(err));
         return ESP_ERR_INVALID_STATE;
     }
 
-    err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_bt_controller_enable failed: %s", esp_err_to_name(err));
-        return ESP_ERR_INVALID_STATE;
-    }
+    ble_hs_cfg.reset_cb = ble_on_reset;
+    ble_hs_cfg.sync_cb = ble_on_sync;
+    /* Central/GATT-client role only - no store config, no GAP/GATT
+     * server callbacks, keeping the linked-in surface minimal. */
 
-    err = esp_bluedroid_init();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_bluedroid_init failed: %s", esp_err_to_name(err));
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    err = esp_bluedroid_enable();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_bluedroid_enable failed: %s", esp_err_to_name(err));
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    err = esp_spp_register_callback(obd_spp_callback);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_spp_register_callback failed: %s", esp_err_to_name(err));
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    esp_spp_cfg_t spp_cfg = {
-        .mode = ESP_SPP_MODE_CB,
-        .enable_l2cap_ertm = true,
-    };
-    err = esp_spp_enhanced_init(&spp_cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_spp_enhanced_init failed: %s", esp_err_to_name(err));
-        return ESP_ERR_INVALID_STATE;
-    }
+    nimble_port_freertos_init(ble_host_task);
 
     BaseType_t task_created = xTaskCreatePinnedToCore(
-        obd_bt_connection_task, "obd_bt_conn_task", TASK_STACK_SIZE_OBD, NULL,
+        obd_ble_connection_task, "obd_ble_conn_task", TASK_STACK_SIZE_OBD, NULL,
         TASK_PRIORITY_OBD, NULL, TASK_CORE_SENSOR_ACQUISITION);
     if (task_created != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create OBD Bluetooth connection task");
+        ESP_LOGE(TAG, "Failed to create OBD BLE connection task");
         return ESP_ERR_NO_MEM;
     }
 
     s_initialized = true;
-    ESP_LOGI(TAG, "OBD-II Bluetooth (SPP/ELM327) driver initialized");
+    ESP_LOGI(TAG, "OBD-II BLE (NimBLE/ELM327 UART-bridge) driver initialized");
     return ESP_OK;
 }
 
@@ -473,10 +821,10 @@ esp_err_t obd_read(obd_data_t *data)
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (!s_spp_connected || !s_elm327_configured) {
-        /* Not connected right now - same "report honestly, don't hold
-         * stale data" behavior as the CAN version's bus-disconnected
-         * case; sensor_manager's OBD task clears its cache on this. */
+    if (s_state != OBD_BLE_STATE_READY) {
+        /* Not connected/subscribed/configured right now - same "report
+         * honestly, don't hold stale data" behavior as earlier versions;
+         * sensor_manager's OBD task clears its cache on this. */
         return ESP_ERR_TIMEOUT;
     }
 

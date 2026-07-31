@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include "driver/i2c.h"
 #include "driver/uart.h"
+#include "host/ble_hs.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,9 +26,9 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Firmware Identification
  * ------------------------------------------------------------------------- */
-#define FIRMWARE_VERSION_MAJOR         1
-#define FIRMWARE_VERSION_MINOR         1
-#define FIRMWARE_VERSION_PATCH         0
+#define FIRMWARE_VERSION_MAJOR         3
+#define FIRMWARE_VERSION_MINOR         0
+#define FIRMWARE_VERSION_PATCH         1
 #define DEVICE_TYPE_STRING             "DBAS-ESP32"
 #define DEVICE_ID_MAX_LEN              32   /* Derived from MAC at runtime */
 
@@ -40,8 +41,8 @@ extern "C" {
  * defined here as macros to keep this reference implementation
  * self-contained and fully compilable out of the box.
  * ------------------------------------------------------------------------- */
-#define WIFI_SSID                      "WifiName"
-#define WIFI_PASSWORD                  "WifiPass"
+#define WIFI_SSID                      "Amber"
+#define WIFI_PASSWORD                  "123456789@"
 #define WIFI_MAX_RETRY_COUNT           10
 #define WIFI_RECONNECT_DELAY_MS        5000
 #define WIFI_CONNECT_TIMEOUT_MS        15000
@@ -49,7 +50,7 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * MQTT Configuration
  * ------------------------------------------------------------------------- */
-#define MQTT_BROKER_URI                "mqtt://192.168.1.6:1883"
+#define MQTT_BROKER_URI                "mqtt://192.168.1.20:1883"
 #define MQTT_CLIENT_ID_PREFIX          "dbas_"
 #define MQTT_KEEPALIVE_SEC             60
 #define MQTT_QOS_TELEMETRY             1
@@ -104,16 +105,20 @@ extern "C" {
  * ELM327-Original BT (CAN) / OBD-II Configuration
  * ------------------------------------------------------------------------- */
 
-#define OBD_BT_TARGET_MAC              { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }  /* your dongle's MAC */
+#define OBD_BT_TARGET_MAC              { 0x96, 0x02, 0x00, 0x11, 0x1E, 0x66 }  /* your dongle's MAC */
 #define OBD_BT_SPP_SCN                 1
-#define OBD_BT_CONNECT_TIMEOUT_MS      10000
-#define OBD_BT_RECONNECT_DELAY_MS      5000
+#define OBD_BT_CONNECT_TIMEOUT_MS      8000
+#define OBD_BT_RECONNECT_DELAY_MS      3000
 
 /* Standard OBD-II Mode 01 PIDs used by this system */
 #define OBD_PID_ENGINE_RPM              0x0C
 #define OBD_PID_VEHICLE_SPEED           0x0D
 #define OBD_PID_THROTTLE_POSITION       0x11
 #define OBD_PID_ENGINE_COOLANT_TEMP     0x05
+
+/* ELM327BLE - nimBLE additions */
+#define OBD_BLE_TARGET_ADDR_TYPE BLE_ADDR_PUBLIC
+
 
 /* ---------------------------------------------------------------------------
  * Task Priorities

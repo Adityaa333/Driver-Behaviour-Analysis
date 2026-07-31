@@ -30,13 +30,23 @@ static const char *TAG = "app_main";
 static void register_default_geofence_zones(void)
 {
     uint8_t zone_index = 0;
-    esp_err_t err = geofence_add_zone("Depot", 37.7749, -122.4194, 500.0f,
-                                       GEOFENCE_ZONE_ALLOWED, &zone_index);
+
+    esp_err_t err = geofence_add_zone(
+        "CDAC ACTS",
+        18.535229,
+        73.811121,
+        1000.0f,
+        GEOFENCE_ZONE_ALLOWED,
+        &zone_index);
+
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to register default depot geofence zone: %s",
+        ESP_LOGW(TAG,
+                 "Failed to register default geofence zone: %s",
                  esp_err_to_name(err));
     } else {
-        ESP_LOGI(TAG, "Default depot geofence zone registered at index %d", zone_index);
+        ESP_LOGI(TAG,
+                 "Default geofence zone registered at index %d",
+                 zone_index);
     }
 }
 
