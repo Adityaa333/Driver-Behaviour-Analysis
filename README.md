@@ -92,11 +92,12 @@ The system consists of an ESP32-based firmware that interfaces with vehicle sens
 1. Clone the repository:
    ```bash
    git clone https://github.com/your-username/Driver-Behaviour-Analysis.git
-   cd Driver-Behaviour-Analysis
+   cd Driver-Behaviour-Analysis/firmware/DBAS
    ```
 
 2. Configure the firmware:
-   - Update the Wi-Fi credentials and MQTT broker settings in `config.h`.
+   - Update the Wi-Fi credentials , OBD-II MAC-id and MQTT broker settings in `config.h`.
+   - Add geofence-zones in `app_main.c`
 
 3. Build and flash the firmware:
    ```bash
@@ -108,8 +109,15 @@ The system consists of an ESP32-based firmware that interfaces with vehicle sens
    - Import the `dashboard/flow.json` into Node-RED.
 
 5. Start the MQTT broker:
-   ```bash
-   mosquitto
+   Config file changes for `mosquitto.conf` :
+   - listener 1883
+   - allow_anonymous true
+   ```cmd
+   "C:\Program Files\Mosquitto\mosquitto.exe" -c "C:\Program Files\Mosquitto\mosquitto.conf" -v
+   ```
+   To log all data : 
+   ```cmd
+   "C:\Program Files\mosquitto\mosquitto_sub.exe" -h localhost -t "fleet/#" -v
    ```
 
 ---
