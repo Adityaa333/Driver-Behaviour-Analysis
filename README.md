@@ -1,9 +1,10 @@
 # Driver Behaviour Analysis System
 
 ![C](https://img.shields.io/badge/C-Language-blue)
-![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.x-red)
+![ESP32](https://img.shields.io/badge/ESP32-Firmware-green)
+![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.x-yellow)
 ![Node-RED](https://img.shields.io/badge/Node--RED-Dashboard-red)
-![ESP32](https://img.shields.io/badge/ESP32-Firmware-orange)
+
 
 ## Project Overview
 
