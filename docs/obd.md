@@ -88,7 +88,7 @@ So under the hood, `obd_read()` is really just:
 
 In `config.h`:
 
-- `OBD_BT_TARGET_MAC` — the Bluetooth address of your specific dongle
+- `OBD_BT_TARGET_MAC` — the Bluetooth address of your specific dongle (ELM327) 
 - `OBD_BT_SPP_SCN` — which "channel" to talk to it on (often `1`, but
   not guaranteed — depends on the dongle)
 - `OBD_REQUEST_TIMEOUT_MS` — how long to wait for a reply before giving
