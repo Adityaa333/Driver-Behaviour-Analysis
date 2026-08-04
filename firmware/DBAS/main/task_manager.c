@@ -14,6 +14,8 @@
 #include "crash_detection.h"
 #include "idling_detection.h"
 #include "geofence.h"
+#include "led_indicator.h"
+
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -230,6 +232,12 @@ void task_manager_start_all(void)
         ESP_LOGE(TAG, "geofence failed to start; continuing without it");
     }
 
+    /* Purely cosmetic/diagnostic - drives the onboard LED off GPS fix
+     * quality. Never fatal: a dead LED doesn't affect scoring or safety. */
+    if (init_with_retry(led_indicator_init, "led_indicator") != ESP_OK) {
+        ESP_LOGE(TAG, "led_indicator failed to start; continuing without it");
+    }
+    
     /* Telemetry/status publishing tasks. Priorities/stack sizes reuse
      * wifi_manager's constants from config.h: both tasks are low
      * frequency, non-time-critical background reporting work, the same

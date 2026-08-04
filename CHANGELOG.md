@@ -3,6 +3,11 @@
 All notable changes to the Driver Behaviour Analysis System (DBAS) project will be documented in this file.
 ---
 
+## [3.1.1] - 2026-08-01
+
+### Added
+- Added indicator task for GPS satellite connection success based on number of satellites & DOP.
+
 ## [3.0.1] - 2026-08-01
 
 ### Fixed
