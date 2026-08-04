@@ -27,7 +27,7 @@ extern "C" {
  * Firmware Identification
  * ------------------------------------------------------------------------- */
 #define FIRMWARE_VERSION_MAJOR         3
-#define FIRMWARE_VERSION_MINOR         0
+#define FIRMWARE_VERSION_MINOR         1
 #define FIRMWARE_VERSION_PATCH         1
 #define DEVICE_TYPE_STRING             "DBAS-ESP32"
 #define DEVICE_ID_MAX_LEN              32   /* Derived from MAC at runtime */
@@ -50,7 +50,7 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * MQTT Configuration
  * ------------------------------------------------------------------------- */
-#define MQTT_BROKER_URI                "mqtt://192.168.1.20:1883"
+#define MQTT_BROKER_URI                "mqtt://172.20.10.5:1883"
 #define MQTT_CLIENT_ID_PREFIX          "dbas_"
 #define MQTT_KEEPALIVE_SEC             60
 #define MQTT_QOS_TELEMETRY             1
@@ -90,16 +90,6 @@ extern "C" {
 #define GPS_UART_RX_BUF_SIZE            2048
 #define GPS_SAMPLE_PERIOD_MS            1000    /* 1 Hz, typical NMEA rate */
 #define GPS_NMEA_MAX_SENTENCE_LEN       128
-#define GPS_READY_MIN_SATELLITES        5
-#define GPS_READY_MAX_HDOP              3.0f
-
-/* ---------------------------------------------------------------------------
- * GPS Status LED
- * ------------------------------------------------------------------------- */
-#define LED_STATUS_GPIO                 2       /* Onboard LED on most ESP32 devkits */
-#define LED_CHECK_PERIOD_MS             500     /* Also doubles as blink half-period */
-#define TASK_PRIORITY_LED_INDICATOR     2
-#define TASK_STACK_SIZE_LED_INDICATOR   2048
 
 /* ---------------------------------------------------------------------------
  * TWAI (CAN) / OBD-II Configuration

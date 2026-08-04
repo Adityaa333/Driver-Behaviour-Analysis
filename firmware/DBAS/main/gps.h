@@ -35,14 +35,6 @@ typedef struct {
     uint8_t satellites_in_use;  /*!< Number of satellites used in fix */
     bool fix_valid;             /*!< True if the last RMC sentence reported
                                       an active ('A') fix status */
-
-    uint8_t fix_quality;        /*!< GGA fix quality: 0=invalid, 1=GPS,
-                                      2=DGPS, etc. */
-    uint8_t fix_type;           /*!< GSA fix type: 1=no fix, 2=2D, 3=3D */
-    float pdop;                 /*!< Position dilution of precision (GSA) */
-    float hdop;                 /*!< Horizontal dilution of precision (GSA) */
-    float vdop;                 /*!< Vertical dilution of precision (GSA) */
-
     int64_t timestamp_us;       /*!< Time this snapshot was assembled
                                       (esp_timer), regardless of fix_valid */
 } gps_data_t;
@@ -85,27 +77,6 @@ esp_err_t gps_get_latest(gps_data_t *data);
  *         fix has ever been received.
  */
 int64_t gps_get_fix_age_ms(void);
-
-/**
- * @brief Evaluate whether the current GPS fix is good enough to trust
- *        for safety-relevant use (e.g. gating a status LED, or a future
- *        "GPS ready" gate on geofence/crash location reporting).
- *
- * A fix is considered ready when all of the following hold on the
- * latest snapshot:
- *   - fix_valid is true (RMC reported an active 'A' fix)
- *   - fix_quality > 0 (GGA did not report "invalid")
- *   - satellites_in_use >= GPS_READY_MIN_SATELLITES
- *   - hdop <= GPS_READY_MAX_HDOP
- *
- * Thresholds are defined in config.h. Returns false (not ready) if
- * gps_init() has not been called or no sentence has ever been parsed,
- * since s_latest's defaults (fix_quality=0, hdop=99.9) fail the check
- * safely.
- *
- * @return true if the fix meets all readiness criteria.
- */
-bool gps_is_ready(void);
 
 #ifdef __cplusplus
 }

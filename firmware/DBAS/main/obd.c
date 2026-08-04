@@ -68,6 +68,8 @@ static const char *TAG = "obd";
 #define OBD_RESPONSE_BUF_LEN        256    /* Accumulated ASCII response */
 #define OBD_AT_RETRY_COUNT          3
 #define OBD_DESIRED_ATT_MTU         185    /* Comfortably fits one ELM327 line */
+#define OBD_WRITE_ACK_TIMEOUT_MS     500    /* Max wait for the GATT write procedure to complete */
+#define OBD_SEARCHING_EXTRA_MS       4000   /* Extra grace time once "SEARCHING..." is observed */
 
 /* GATT layer for the "UART bridge" service exposed by the dongle
  * (see ble_scanner log: services=["1804","180F","FFF0","AE30","AE3A"],
@@ -100,6 +102,10 @@ typedef enum {
 #define OBD_EVENT_HOST_SYNCED       (1 << 0)
 #define OBD_EVENT_DISCOVERY_DONE    (1 << 1)
 #define OBD_EVENT_DISCOVERY_FAILED  (1 << 2)
+#define OBD_EVENT_HOST_SYNCED       (1 << 0)
+#define OBD_EVENT_DISCOVERY_DONE    (1 << 1)
+#define OBD_EVENT_DISCOVERY_FAILED  (1 << 2)
+#define OBD_EVENT_WRITE_COMPLETE    (1 << 3)   /* NEW: signals the ATT write itself finished */
 
 static volatile obd_ble_state_t s_state = OBD_BLE_STATE_DISCONNECTED;
 static SemaphoreHandle_t s_bus_mutex = NULL;   /* Serializes one request at a time */
@@ -126,6 +132,25 @@ static bool s_initialized = false;
  * ------------------------------------------------------------------------- */
 static int ble_gap_event_cb(struct ble_gap_event *event, void *arg);
 static void obd_ble_connection_task(void *arg);
+
+/**
+ * @brief Reset per-connection GATT discovery state (service/characteristic/
+ *        descriptor handles) before starting a fresh connection attempt.
+ *
+ * Handle values are only meaningful for the lifetime of a single BLE
+ * connection. Without this reset, a retry after a dropped or failed
+ * connection could see stale non-zero handles left over from the
+ * previous attempt, which the discovery callbacks below use as their
+ * "already found" signal.
+ */
+static void obd_reset_discovery_state(void)
+{
+    s_svc_start_handle = 0;
+    s_svc_end_handle = 0;
+    s_notify_val_handle = 0;
+    s_write_val_handle = 0;
+    s_cccd_handle = 0;
+}
 
 /* ---------------------------------------------------------------------------
  * GATT Discovery Chain
@@ -162,6 +187,10 @@ static int on_dsc_disc(uint16_t conn_handle, const struct ble_gatt_error *error,
     (void)arg;
     (void)chr_val_handle;
 
+if (error->status == 0 && dsc != NULL) {
+    ESP_LOGI(TAG, "Descriptor discovered: handle=%u", dsc->handle);
+}
+
     if (error->status == 0 && dsc != NULL &&
         ble_uuid_cmp(&dsc->uuid.u, &s_dsc_cccd_uuid.u) == 0) {
         s_cccd_handle = dsc->handle;
@@ -170,8 +199,19 @@ static int on_dsc_disc(uint16_t conn_handle, const struct ble_gatt_error *error,
 
     if (error->status == BLE_HS_EDONE) {
         if (s_cccd_handle == 0) {
-            ESP_LOGE(TAG, "FFF1 has no CCCD (0x2902) descriptor - cannot subscribe");
-            xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+            /* Cheap "UART-bridge" ELM327 BLE clones commonly don't
+             * implement a CCCD (0x2902) descriptor on their notify
+             * characteristic at all - notifications are either always-on
+             * from the moment of connection, or enabled implicitly by the
+             * peripheral itself, with no standard GATT subscription
+             * mechanism exposed. Since there is nothing to write in that
+             * case, treat this as "already subscribed" and proceed
+             * straight to the ELM327 AT setup sequence rather than
+             * failing discovery and endlessly reconnecting. */
+            ESP_LOGW(TAG, "FFF1 has no CCCD descriptor; assuming notifications "
+                     "are already enabled (known behavior on some ELM327 BLE clones)");
+            s_state = OBD_BLE_STATE_SUBSCRIBED;
+            xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_DONE);
             return 0;
         }
         /* Notifications (not indications): write 0x0001 little-endian. */
@@ -186,6 +226,7 @@ static int on_dsc_disc(uint16_t conn_handle, const struct ble_gatt_error *error,
         return 0;
     }
 
+
     if (error->status != 0 && error->status != BLE_HS_EDONE) {
         ESP_LOGE(TAG, "Descriptor discovery failed, status=%d", error->status);
         xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
@@ -198,23 +239,35 @@ static int on_chr_write_disc(uint16_t conn_handle, const struct ble_gatt_error *
 {
     (void)arg;
 
-    if (error->status != 0 || chr == NULL) {
-        ESP_LOGE(TAG, "FFF2 (write) characteristic not found, status=%d", error->status);
-        xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+    if (error->status == 0 && chr != NULL) {
+        /* Record only - see on_svc_disc for why we don't act here. */
+        s_write_val_handle = chr->val_handle;
+        ESP_LOGI(TAG, "Discovered FFF2 (write) at handle %d", s_write_val_handle);
         return 0;
     }
 
-    s_write_val_handle = chr->val_handle;
-    ESP_LOGI(TAG, "Discovered FFF2 (write) at handle %d", s_write_val_handle);
+    if (error->status == BLE_HS_EDONE) {
+        if (s_write_val_handle == 0) {
+            ESP_LOGE(TAG, "FFF2 (write) characteristic not found");
+            xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+            return 0;
+        }
 
-    /* Next: find FFF1's CCCD descriptor so we can subscribe. Descriptors
-     * live between FFF1's value handle and the end of the service. */
-    int rc = ble_gattc_disc_all_dscs(conn_handle, s_notify_val_handle + 1,
-                                      s_svc_end_handle, on_dsc_disc, NULL);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gattc_disc_all_dscs failed, rc=%d", rc);
-        xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+        /* Next: find FFF1's CCCD descriptor so we can subscribe.
+         * Descriptors live between FFF1's value handle and the end of
+         * the service. */
+        ESP_LOGI(TAG, "Beginning descriptor discovery for FFF1 CCCD");
+        int rc = ble_gattc_disc_all_dscs(conn_handle, s_svc_start_handle,
+                                          s_svc_end_handle, on_dsc_disc, NULL);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "ble_gattc_disc_all_dscs failed, rc=%d", rc);
+            xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+        }
+        return 0;
     }
+
+    ESP_LOGE(TAG, "FFF2 discovery failed, status=%d", error->status);
+    xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
     return 0;
 }
 
@@ -223,23 +276,34 @@ static int on_chr_notify_disc(uint16_t conn_handle, const struct ble_gatt_error 
 {
     (void)arg;
 
-    if (error->status != 0 || chr == NULL) {
-        ESP_LOGE(TAG, "FFF1 (notify) characteristic not found, status=%d", error->status);
-        xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+    if (error->status == 0 && chr != NULL) {
+        /* Record only - see on_svc_disc for why we don't act here. */
+        s_notify_val_handle = chr->val_handle;
+        ESP_LOGI(TAG, "Discovered FFF1 (notify) at handle %d", s_notify_val_handle);
         return 0;
     }
 
-    s_notify_val_handle = chr->val_handle;
-    ESP_LOGI(TAG, "Discovered FFF1 (notify) at handle %d", s_notify_val_handle);
+    if (error->status == BLE_HS_EDONE) {
+        if (s_notify_val_handle == 0) {
+            ESP_LOGE(TAG, "FFF1 (notify) characteristic not found");
+            xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+            return 0;
+        }
 
-    /* Next: FFF2 (write). Searching the whole service range again is
-     * fine - NimBLE only returns handles inside [start,end]. */
-    int rc = ble_gattc_disc_chrs_by_uuid(conn_handle, s_svc_start_handle, s_svc_end_handle,
-                                          &s_chr_write_uuid.u, on_chr_write_disc, NULL);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gattc_disc_chrs_by_uuid(FFF2) failed, rc=%d", rc);
-        xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+        /* Next: FFF2 (write). Searching the whole service range again is
+         * fine - NimBLE only returns handles inside [start,end]. */
+        ESP_LOGI(TAG, "Beginning discovery of FFF2 (write) characteristic");
+        int rc = ble_gattc_disc_chrs_by_uuid(conn_handle, s_svc_start_handle, s_svc_end_handle,
+                                              &s_chr_write_uuid.u, on_chr_write_disc, NULL);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "ble_gattc_disc_chrs_by_uuid(FFF2) failed, rc=%d", rc);
+            xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+        }
+        return 0;
     }
+
+    ESP_LOGE(TAG, "FFF1 discovery failed, status=%d", error->status);
+    xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
     return 0;
 }
 
@@ -248,24 +312,40 @@ static int on_svc_disc(uint16_t conn_handle, const struct ble_gatt_error *error,
 {
     (void)arg;
 
-    if (error->status != 0 || service == NULL) {
-        ESP_LOGE(TAG, "FFF0 service not found, status=%d", error->status);
-        xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+    if (error->status == 0 && service != NULL) {
+        /* Record only - do not act yet. Acting here risks launching the
+         * next discovery stage twice if a non-compliant peripheral (cheap
+         * ELM327 clones are notorious for this) ever reports a duplicate
+         * match before the search concludes. */
+        s_svc_start_handle = service->start_handle;
+        s_svc_end_handle = service->end_handle;
+        s_cccd_handle = 0;
+        ESP_LOGI(TAG, "Discovered FFF0 service, handles [%d,%d]",
+                 s_svc_start_handle, s_svc_end_handle);
         return 0;
     }
 
-    s_svc_start_handle = service->start_handle;
-    s_svc_end_handle = service->end_handle;
-    s_cccd_handle = 0;
-    ESP_LOGI(TAG, "Discovered FFF0 service, handles [%d,%d]",
-             s_svc_start_handle, s_svc_end_handle);
+    if (error->status == BLE_HS_EDONE) {
+        /* Search has conclusively finished. Only now check whether a
+         * handle was found and, if so, launch the next stage. */
+        if (s_svc_start_handle == 0) {
+            ESP_LOGE(TAG, "FFF0 service not found on this device");
+            xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+            return 0;
+        }
 
-    int rc = ble_gattc_disc_chrs_by_uuid(conn_handle, s_svc_start_handle, s_svc_end_handle,
-                                          &s_chr_notify_uuid.u, on_chr_notify_disc, NULL);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gattc_disc_chrs_by_uuid(FFF1) failed, rc=%d", rc);
-        xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+        ESP_LOGI(TAG, "Beginning discovery of FFF1 (notify) characteristic");
+        int rc = ble_gattc_disc_chrs_by_uuid(conn_handle, s_svc_start_handle, s_svc_end_handle,
+                                              &s_chr_notify_uuid.u, on_chr_notify_disc, NULL);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "ble_gattc_disc_chrs_by_uuid(FFF1) failed, rc=%d", rc);
+            xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
+        }
+        return 0;
     }
+
+    ESP_LOGE(TAG, "Service discovery failed, status=%d", error->status);
+    xEventGroupSetBits(s_event_group, OBD_EVENT_DISCOVERY_FAILED);
     return 0;
 }
 
@@ -334,11 +414,19 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
 
             obd_rx_chunk_t chunk;
             uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
+	ESP_LOGI(TAG, "BLE notification received, handle=%u len=%u",
+         event->notify_rx.attr_handle, len);
             if (len > OBD_RX_CHUNK_MAX_LEN) {
                 len = OBD_RX_CHUNK_MAX_LEN;
             }
             os_mbuf_copydata(event->notify_rx.om, 0, len, chunk.data);
             chunk.len = len;
+	char rx_str[248];
+
+	memcpy(rx_str, chunk.data, len);
+	rx_str[len] = '\0';
+
+ESP_LOGI(TAG, "BLE RX: \"%s\"", rx_str);
 
             if (xQueueSend(s_rx_queue, &chunk, 0) != pdTRUE) {
                 ESP_LOGW(TAG, "OBD RX queue full, dropping notification chunk");
@@ -349,6 +437,29 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
         default:
             return 0;
     }
+}
+
+/**
+ * @brief Completion callback for ble_gattc_write_flat(). Without this,
+ *        obd_send_command_locked() had no way to know the underlying ATT
+ *        write procedure actually finished before moving on - if a new
+ *        write was issued while the previous one's procedure slot hadn't
+ *        been freed yet, NimBLE's small internal GATT-procedure pool
+ *        could be exhausted ("GATTC proc alloc failed", rc=6/69).
+ */
+static int on_write_complete(uint16_t conn_handle, const struct ble_gatt_error *error,
+                              struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn_handle;
+    (void)attr;
+    (void)arg;
+
+    if (error->status != 0) {
+        ESP_LOGW(TAG, "GATT write procedure failed, status=%d", error->status);
+    }
+
+    xEventGroupSetBits(s_event_group, OBD_EVENT_WRITE_COMPLETE);
+    return 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -363,11 +474,12 @@ static esp_err_t obd_read_response_until_prompt_locked(char *out_buf, size_t out
 {
     size_t written = 0;
     out_buf[0] = '\0';
+    bool searching_extended = false;
 
     int64_t deadline_us = esp_timer_get_time() + ((int64_t)timeout_ms * 1000);
 
     for (;;) {
-        if (s_state != OBD_BLE_STATE_READY) {
+        if (s_state != OBD_BLE_STATE_READY && s_state != OBD_BLE_STATE_SUBSCRIBED) {
             return ESP_ERR_INVALID_STATE; /* Disconnected mid-request */
         }
 
@@ -389,13 +501,28 @@ static esp_err_t obd_read_response_until_prompt_locked(char *out_buf, size_t out
                 return ESP_OK;
             }
         }
+        out_buf[written] = '\0';
+
+        /* The dongle emits "SEARCHING..." while it auto-detects the OBD
+         * protocol (ATSP0) - this can legitimately take several seconds,
+         * far longer than a normal per-PID exchange. Grant one extension
+         * to the deadline instead of timing out mid-search; without this,
+         * the real response arrives after we've already given up and
+         * moved on, and gets misread as the response to whatever command
+         * we send next (the response desync seen in the field log). */
+        if (!searching_extended && strstr(out_buf, "SEARCHING") != NULL) {
+            ESP_LOGI(TAG, "Protocol search in progress, extending deadline by %dms",
+                     OBD_SEARCHING_EXTRA_MS);
+            deadline_us = esp_timer_get_time() + ((int64_t)OBD_SEARCHING_EXTRA_MS * 1000);
+            searching_extended = true;
+        }
     }
 }
 
 static esp_err_t obd_send_command_locked(const char *cmd, char *resp_buf, size_t resp_buf_len,
                                           uint32_t timeout_ms)
 {
-    if (s_state != OBD_BLE_STATE_READY) {
+    if (s_state != OBD_BLE_STATE_READY && s_state != OBD_BLE_STATE_SUBSCRIBED) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -407,10 +534,38 @@ static esp_err_t obd_send_command_locked(const char *cmd, char *resp_buf, size_t
         /* discard */
     }
 
-    int rc = ble_gattc_write_no_rsp_flat(s_conn_handle, s_write_val_handle,
-                                          cmd, (uint16_t)strlen(cmd));
+    ESP_LOGI(TAG, "TX -> \"%s\"", cmd);
+
+    xEventGroupClearBits(s_event_group, OBD_EVENT_WRITE_COMPLETE);
+
+    int rc = ble_gattc_write_flat(
+        s_conn_handle,
+        s_write_val_handle,
+        cmd,
+        (uint16_t)strlen(cmd),
+        on_write_complete,
+        NULL);
+
     if (rc != 0) {
-        ESP_LOGW(TAG, "ble_gattc_write_no_rsp_flat failed for command \"%s\", rc=%d", cmd, rc);
+        ESP_LOGW(TAG, "ble_gattc_write_flat failed for command \"%s\", rc=%d", cmd, rc);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    /* Wait for the ATT write procedure to actually finish before doing
+     * anything else. Previously this returned immediately after queuing
+     * the write (callback was NULL), so a retried/next command could be
+     * issued while NimBLE's internal procedure slot for the prior write
+     * was still occupied, exhausting its small concurrent-procedure pool
+     * ("GATTC proc alloc failed", rc=6/69 seen in the field log). */
+    EventBits_t bits = xEventGroupWaitBits(
+        s_event_group,
+        OBD_EVENT_WRITE_COMPLETE,
+        pdTRUE,   /* clear on exit */
+        pdTRUE,
+        pdMS_TO_TICKS(OBD_WRITE_ACK_TIMEOUT_MS));
+
+    if (!(bits & OBD_EVENT_WRITE_COMPLETE)) {
+        ESP_LOGW(TAG, "Timed out waiting for GATT write completion for \"%s\"", cmd);
         return ESP_ERR_TIMEOUT;
     }
 
@@ -620,6 +775,12 @@ static void obd_ble_connection_task(void *arg)
                              OBD_EVENT_DISCOVERY_DONE |
                              OBD_EVENT_DISCOVERY_FAILED);
 
+        /* Discovery handles are only valid for a single connection's
+         * lifetime; clear them so this attempt's discovery callbacks
+         * don't mistake a stale handle from a prior attempt for
+         * "already found". */
+        obd_reset_discovery_state();
+
         ESP_LOGI(TAG, "Attempting BLE connection to OBD dongle");
         s_state = OBD_BLE_STATE_CONNECTING;
 
@@ -746,6 +907,19 @@ static void obd_ble_connection_task(void *arg)
             }
 
             xSemaphoreGive(s_bus_mutex);
+
+            if (err != ESP_OK) {
+                /* ble_gap_terminate() above is asynchronous - the actual
+                 * disconnect only completes when BLE_GAP_EVENT_DISCONNECT
+                 * fires. Without this delay, the loop falls straight
+                 * through to the top and calls ble_gap_connect() again
+                 * while NimBLE's GAP layer is still mid-teardown for the
+                 * previous connection, which the controller rejects
+                 * (observed as "ble_gap_connect failed to start, rc=14").
+                 * Mirrors the delay already used on the discovery-timeout
+                 * failure path above. */
+                vTaskDelay(pdMS_TO_TICKS(OBD_BT_RECONNECT_DELAY_MS));
+            }
         }
 
         /* Idle while the connection remains healthy. If the peer

@@ -45,11 +45,6 @@ static gps_data_t s_latest = {
     .altitude_m = 0.0f,
     .satellites_in_use = 0,
     .fix_valid = false,
-    .fix_quality = 0,
-    .fix_type = 1,        /* "no fix" per GSA convention */
-    .pdop = 99.9f,
-    .hdop = 99.9f,
-    .vdop = 99.9f,
     .timestamp_us = 0,
 };
 
@@ -58,11 +53,6 @@ static gps_data_t s_latest = {
  * arrive separately within the same reporting cycle. */
 static float s_working_altitude_m = 0.0f;
 static uint8_t s_working_satellites = 0;
-static uint8_t s_working_fix_quality = 0;   /* from GGA */
-static uint8_t s_working_fix_type = 1;      /* from GSA, default "no fix" */
-static float s_working_pdop = 99.9f;        /* safe/bad defaults until parsed */
-static float s_working_hdop = 99.9f;
-static float s_working_vdop = 99.9f;
 
 static int64_t s_last_valid_fix_time_us = -1;
 
@@ -180,15 +170,9 @@ static void gps_parse_rmc(char *sentence)
         s_latest.heading_deg = heading_deg;
         s_last_valid_fix_time_us = esp_timer_get_time();
     }
-    
     s_latest.fix_valid = fix_valid;
     s_latest.altitude_m = s_working_altitude_m;
     s_latest.satellites_in_use = s_working_satellites;
-    s_latest.fix_quality = s_working_fix_quality;
-    s_latest.fix_type = s_working_fix_type;
-    s_latest.pdop = s_working_pdop;
-    s_latest.hdop = s_working_hdop;
-    s_latest.vdop = s_working_vdop;
     s_latest.timestamp_us = esp_timer_get_time();
 
     xSemaphoreGive(s_data_mutex);
@@ -201,6 +185,8 @@ static void gps_parse_rmc(char *sentence)
  */
 static void gps_parse_gga(char *sentence)
 {
+    /* Field layout:
+     * $--GGA,time,lat,NS,lon,EW,fixquality,numSV,HDOP,alt,M,... */
     char *fields[10] = { NULL };
     int count = nmea_split_fields(sentence, fields, 10);
 
@@ -220,47 +206,6 @@ static void gps_parse_gga(char *sentence)
 
     s_working_altitude_m = altitude_m;
     s_working_satellites = satellites;
-    s_working_fix_quality = (uint8_t)fix_quality;
-
-    xSemaphoreGive(s_data_mutex);
-}
-
-/**
- * @brief Parse a GSA sentence and update the working DOP/fix-type
- *        fields. Like altitude/satellites from GGA, these are merged
- *        into s_latest on the next RMC update rather than published
- *        immediately, since GSA/GGA/RMC arrive as separate sentences
- *        within the same reporting cycle and RMC is what currently
- *        drives the merge point.
- *        Expects a mutable, NUL-terminated copy of the sentence.
- */
-static void gps_parse_gsa(char *sentence)
-{
-    /* Field layout:
-     * $--GSA,mode1,mode2,sv1,sv2,...,sv12,PDOP,HDOP,VDOP*hh
-     * mode2 (fields[2]) is the fix type: 1=no fix, 2=2D, 3=3D. */
-    char *fields[19] = { NULL };
-    int count = nmea_split_fields(sentence, fields, 19);
-
-    if (count < 18) {
-        ESP_LOGW(TAG, "GSA sentence has too few fields (%d), discarding", count);
-        return;
-    }
-
-    uint8_t fix_type = (uint8_t)atoi(fields[2]);
-    float pdop = (float)atof(fields[15]);
-    float hdop = (float)atof(fields[16]);
-    float vdop = (float)atof(fields[17]);
-
-    if (xSemaphoreTake(s_data_mutex, pdMS_TO_TICKS(MUTEX_MAX_WAIT_MS)) != pdTRUE) {
-        ESP_LOGE(TAG, "Timed out acquiring GPS data mutex in GSA handler");
-        return;
-    }
-
-    s_working_fix_type = fix_type;
-    s_working_pdop = pdop;
-    s_working_hdop = hdop;
-    s_working_vdop = vdop;
 
     xSemaphoreGive(s_data_mutex);
 }
@@ -290,10 +235,8 @@ static void gps_parse_sentence(const char *sentence)
         gps_parse_rmc(work_buf);
     } else if (strncmp(&sentence[3], "GGA", 3) == 0) {
         gps_parse_gga(work_buf);
-    } else if (strncmp(&sentence[3], "GSA", 3) == 0) {
-        gps_parse_gsa(work_buf);
     }
-    /* Other sentence types (GSV, VTG, ...) are intentionally ignored;
+    /* Other sentence types (GSV, GSA, VTG, ...) are intentionally ignored;
      * RMC + GGA together provide every field this system requires. */
 }
 
@@ -430,24 +373,4 @@ int64_t gps_get_fix_age_ms(void)
         return -1;
     }
     return (esp_timer_get_time() - s_last_valid_fix_time_us) / 1000;
-}
-
-bool gps_is_ready(void)
-{
-    if (!s_initialized) {
-        return false;
-    }
-
-    if (xSemaphoreTake(s_data_mutex, pdMS_TO_TICKS(MUTEX_MAX_WAIT_MS)) != pdTRUE) {
-        ESP_LOGE(TAG, "Timed out acquiring GPS data mutex in gps_is_ready");
-        return false;
-    }
-
-    bool ready = s_latest.fix_valid &&
-                 (s_latest.fix_quality > 0) &&
-                 (s_latest.satellites_in_use >= GPS_READY_MIN_SATELLITES) &&
-                 (s_latest.hdop <= GPS_READY_MAX_HDOP);
-
-    xSemaphoreGive(s_data_mutex);
-    return ready;
 }

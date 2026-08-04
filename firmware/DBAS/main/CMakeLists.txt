@@ -13,7 +13,6 @@ idf_component_register(
         "gps.c"
         "mpu6050.c"
         "obd.c"
-        "led_indicator.c"
 
     INCLUDE_DIRS
         "."
