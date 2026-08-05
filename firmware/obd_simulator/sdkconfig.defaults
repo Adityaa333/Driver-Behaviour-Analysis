@@ -1,0 +1,40 @@
+# ============================================================================
+# sdkconfig.defaults
+#
+# Bluetooth: NimBLE host, peripheral-only role (this device only ever
+# advertises + accepts one central connection from the DBAS ESP32 - it
+# never scans or connects out), Bluedroid disabled entirely to keep the
+# NimBLE-only flash/RAM footprint. Mirrors the role split already used
+# on the DBAS side, just inverted (DBAS = central, this = peripheral).
+# ============================================================================
+
+CONFIG_BT_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=n
+
+# Peripheral-only: no central/observer support needed, saves flash.
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+
+# Exactly one peer (the DBAS device) will ever connect at a time.
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_MAX_BONDS=0
+CONFIG_BT_NIMBLE_SM_LEGACY=n
+
+# Give NimBLE host task a comfortable stack; GATT server callbacks and
+# advertising restarts run in this context.
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=4096
+
+# Keep the standard 4MB flash layout assumption explicit for this board.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Console over UART0 (the standard USB-serial path on an ESP32-WROOM
+# devkit) - scenario_manager's console task reconfigures this UART into
+# blocking/line-buffered mode at runtime, but needs it to be UART0 at
+# 115200 to begin with.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_NUM=0
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200

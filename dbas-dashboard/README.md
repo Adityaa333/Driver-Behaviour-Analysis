@@ -1,26 +1,39 @@
-# DBAS Dashboard — Phase 1 (Foundation)
+# DBAS Dashboard
 
 Frontend for the Driver Behaviour Analysis System. Consumes the FastAPI
 backend's REST API exclusively (no Node-RED).
 
-## What's in this pass
+## Status: Phase 2 — fully wired
 
-Per your request to build incrementally, this first delivery covers:
+Every section from the brief is now implemented with real data, not
+placeholders:
 
-1. **Project setup** — Vite + React 19, Tailwind CSS v4, Axios, Recharts,
-   React Leaflet, Framer Motion, Heroicons, React Router.
-2. **Folder structure** — see below.
-3. **API service layer** — one Axios client + one module per resource.
-4. **Routing & layout** — top nav (title, MQTT/Backend status, device
-   picker, live clock) + a dashboard page with the full section grid
-   laid out (stat cards, gauges, charts, map, alerts, crash panel,
-   system status), currently populated with placeholder panels ready to
-   be swapped for the real widgets in the next pass.
+- **Live Snapshot** — 6 stat cards (Safety Score, Vehicle Speed, Engine
+  RPM, Throttle Position, Engine Temperature, GPS Speed), driven by two
+  polled endpoints (`/score`, `/telemetry/latest`).
+- **Instrument Cluster** — hand-built SVG automotive gauges (270°
+  sweep, colored zones, animated needle) for Driver Score and Vehicle
+  Speed.
+- **Trends** — 4 area charts (score, speed, RPM, throttle) built on
+  Recharts, dark-themed, fed by `/score/history` and `/telemetry`.
+- **Vehicle Location** — React Leaflet dark map with a pulsing vehicle
+  marker, auto-pan on position updates, popup with speed/heading. Code-
+  split into its own lazy-loaded chunk since Leaflet is heavy and isn't
+  needed for first paint.
+- **Crash Detection** — SAFE / CRASH DETECTED panel driven by
+  `/crashes`; flashes and pulses for 60s after a crash timestamp (see
+  the comment in `CrashPanel.jsx` for why 60s was chosen relative to the
+  firmware's own 10s cooldown).
+- **Recent Alerts** — table using the backend's own `severity`/`message`
+  fields directly (no re-deriving alert text on the frontend).
+- **System Status** — WiFi/MQTT connectivity, uptime, heap, firmware
+  version (pulled from the device list, since `/status` doesn't carry
+  it), RSSI with a signal-quality label.
 
-The app runs, builds, and polls your backend end-to-end right now:
-device discovery, health checks, and the top nav are fully live. The
-content panels are labeled placeholders until the next incremental
-step.
+Every widget is backed by one of the resource hooks in `src/hooks/`,
+each polling independently at 1s (configurable via `.env`) and each
+tolerant of missing data (no fix yet, no score published yet, etc.)
+without breaking the layout.
 
 ## Getting started
 
@@ -36,26 +49,29 @@ Build for production:
 npm run build
 ```
 
+
 ## Folder structure
 
 ```
 src/
   components/
     layout/     TopNav, DashboardLayout
-    cards/      (next pass) stat cards
-    gauges/     (next pass) score/speed gauges
-    charts/     (next pass) trend charts
-    map/        (next pass) live GPS map
-    alerts/     (next pass) alerts table
-    crash/      (next pass) crash status panel
-    status/     (next pass) system status panel
-    common/     StatusDot, LoadingSpinner, ErrorState, SectionHeader, ComingSoonPanel
+    cards/      StatCardsRow (6 live-snapshot cards)
+    gauges/     RadialGauge (generic SVG gauge), GaugesRow
+    charts/     TrendChart (generic Recharts area chart), ChartsGrid
+    map/        VehicleMap (React Leaflet, lazy-loaded)
+    alerts/     AlertsTable
+    crash/      CrashPanel
+    status/     SystemStatusPanel
+    common/     StatusDot, StatCard, LoadingSpinner, ErrorState, SectionHeader
   pages/        DashboardPage
-  hooks/        usePolling, useDeviceDiscovery, useBackendHealth
+  hooks/        usePolling (base primitive), useDeviceDiscovery, useBackendHealth,
+                useLatestScore, useLatestTelemetry, useScoreHistory,
+                useTelemetryHistory, useDeviceStatus, useDeviceAlerts, useDeviceCrashes
   services/     apiClient, deviceService, scoreService, telemetryService,
                 alertService, statusService
   context/      DeviceContext (shared selected-device state)
-  utils/        formatters.js
+  utils/        formatters.js, gaugeMath.js
   styles/       index.css (Tailwind v4 theme tokens, glassmorphism, dark palette)
 ```
 
@@ -85,12 +101,24 @@ instrument-cluster character), **Inter** for body/UI text, **JetBrains
 Mono** for live telemetry numerals (tabular figures so fast-updating
 numbers don't jitter in width).
 
-## Next steps (subsequent passes)
+## Known data gaps (not frontend bugs)
 
-- Stat cards (Safety Score, Speed, RPM, Throttle, Engine Temp, GPS Speed)
-- Driver Score gauge + Vehicle Speed gauge (Recharts radial)
-- Trend charts: score history, speed history, RPM history, throttle history
-- Live GPS map (React Leaflet) with animated vehicle marker
-- Alerts table (severity, timestamp, description)
-- Crash detection panel (SAFE / CRASH DETECTED, animated on crash)
-- System status panel (WiFi, MQTT, uptime, heap, firmware version, RSSI)
+- **Engine Temperature** — the brief asks for this card, but
+  `task_manager_telemetry_task()` in the firmware never publishes
+  coolant temperature in the telemetry MQTT payload (only accel/gyro/
+  GPS/RPM/OBD-speed/throttle), even though `obd.c` reads it. The
+  `TelemetryOut` schema in `backend/api.py` doesn't carry it either.
+  The card renders honestly as "—" with a "Not published in telemetry"
+  note rather than showing a fabricated number. Wiring this up for real
+  needs a firmware + backend schema change first.
+- **Vehicle Speed** prefers OBD-II (`obd_speed_kmh`) and falls back to
+  GPS speed only when `obd_speed_valid` is false - matching the
+  precedence `driver_score.c` itself uses for overspeed detection.
+
+## Next steps / open to adjust
+
+Everything in the brief is implemented. Natural follow-ups if useful:
+- Wire up a device-vs-device comparison view (multi-device fleet page)
+- Add a settings panel for poll interval / map tile provider
+- Add unit tests around the formatters and the crash-active-window logic
+

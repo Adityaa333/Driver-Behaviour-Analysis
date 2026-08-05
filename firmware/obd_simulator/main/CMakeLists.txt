@@ -6,5 +6,8 @@ idf_component_register(
         "."
 
     REQUIRES
-        driver
+        elm327_sim
+        scenario_manager
+        pid_generator
+        nvs_flash
 )
