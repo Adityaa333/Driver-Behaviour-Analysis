@@ -3,6 +3,26 @@
 All notable changes to the Driver Behaviour Analysis System (DBAS) project will be documented in this file.
 ---
 
+## [3.1.1] - 2026-08-06
+
+### Added
+- Dashboard: Geofence Status panel and map rendering of the configured geofence zone (center + radius). The map now draws the geofence circle to make violations visible in the Vehicle Location view.
+- Dashboard: Score breakdown toggle (expand/collapse) and integration of score-derived alerts into the Recent Alerts list so safety events from score are visible in alerts.
+
+### Changed
+- Dashboard layout: experimented with matching heights for the Vehicle Location panel and the stacked Crash / Geofence panels to improve visual balance. Per user request the previous layout was restored and the geofence UI preserved.
+- Telemetry: engine coolant temperature flow was reviewed and kept (firmware -> backend -> dashboard) so engine temperature is available in live stats when present.
+
+### Fixed
+- Dashboard: resolved a runtime error caused by a missing icon import (ShieldCheckIcon) that previously broke dashboard rendering.
+- Backend: fixed a server-side error affecting /score/history that could return 500; score history now includes rating mapping reliably.
+- Firmware: reverted temporary GPS raw NMEA sentence logging (was added for debugging) so normal log verbosity is restored.
+
+### Removed
+- Experimental LED indicator module (led_indicator) was added during debugging and subsequently removed; no lasting functional change.
+
+---
+
 ## [3.0.1] - 2026-08-01
 
 ### Fixed

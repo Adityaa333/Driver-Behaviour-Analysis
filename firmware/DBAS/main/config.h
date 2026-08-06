@@ -91,12 +91,6 @@ extern "C" {
 #define GPS_SAMPLE_PERIOD_MS            1000    /* 1 Hz, typical NMEA rate */
 #define GPS_NMEA_MAX_SENTENCE_LEN       128
 
-/* LED / GPS readiness thresholds used by led_indicator.c */
-#define LED_STATUS_GPIO                 2
-#define GPS_READY_MIN_SATELLITES        4
-#define GPS_READY_MAX_HDOP              5.0f
-#define LED_CHECK_PERIOD_MS             500
-
 
 /* ---------------------------------------------------------------------------
  * TWAI (CAN) / OBD-II Configuration
@@ -143,7 +137,6 @@ extern "C" {
 #define TASK_PRIORITY_GEOFENCE          5
 #define TASK_PRIORITY_MQTT_PUBLISH      4
 #define TASK_PRIORITY_WIFI_MANAGER      3
-#define TASK_PRIORITY_LED_INDICATOR     2
 
 /* ---------------------------------------------------------------------------
  * Task Stack Sizes (bytes)
@@ -157,7 +150,6 @@ extern "C" {
 #define TASK_STACK_SIZE_GEOFENCE        3072
 #define TASK_STACK_SIZE_MQTT_PUBLISH    4608
 #define TASK_STACK_SIZE_WIFI_MANAGER    4096
-#define TASK_STACK_SIZE_LED_INDICATOR   2048
 
 #define TASK_PRIORITY_CRASH_DETECTION   9
 #define TASK_PRIORITY_MPU6050           7

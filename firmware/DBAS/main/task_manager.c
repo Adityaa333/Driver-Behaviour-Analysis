@@ -14,7 +14,6 @@
 #include "crash_detection.h"
 #include "idling_detection.h"
 #include "geofence.h"
-#include "led_indicator.h"
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -231,10 +230,6 @@ void task_manager_start_all(void)
  
     if (init_with_retry(geofence_init, "geofence") != ESP_OK) {
         ESP_LOGE(TAG, "geofence failed to start; continuing without it");
-    }
- 
-    if (init_with_retry(led_indicator_init, "led_indicator") != ESP_OK) {
-        ESP_LOGE(TAG, "led_indicator failed to start; continuing without it");
     }
  
     /* Telemetry/status publishing tasks. Priorities/stack sizes reuse

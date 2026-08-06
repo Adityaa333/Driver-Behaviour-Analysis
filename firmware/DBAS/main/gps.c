@@ -374,24 +374,3 @@ int64_t gps_get_fix_age_ms(void)
     return (esp_timer_get_time() - s_last_valid_fix_time_us) / 1000;
 }
 
-bool gps_is_ready(void)
-{
-    bool ready = false;
-
-    if (!s_initialized) {
-        return false;
-    }
-
-    if (xSemaphoreTake(s_data_mutex, pdMS_TO_TICKS(MUTEX_MAX_WAIT_MS)) != pdTRUE) {
-        ESP_LOGE(TAG, "Timed out acquiring GPS data mutex in gps_is_ready");
-        return false;
-    }
-
-    /* Consider GPS ready if the last RMC reported an active fix and the
-     * working satellite count meets the configured minimum. HDOP could be
-     * added to this check if the application parses it from GGA. */
-    ready = (s_latest.fix_valid && (s_working_satellites >= GPS_READY_MIN_SATELLITES));
-
-    xSemaphoreGive(s_data_mutex);
-    return ready;
-}
