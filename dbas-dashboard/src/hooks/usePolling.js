@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 const DEFAULT_INTERVAL_MS = Number(import.meta.env.VITE_POLL_INTERVAL_MS) || 1000;
 
@@ -29,24 +29,8 @@ export default function usePolling(fetcher, { intervalMs = DEFAULT_INTERVAL_MS, 
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
 
-  const inFlightRef = useRef(false);
-
-  const tick = useCallback(async () => {
-    if (inFlightRef.current) return;
-    inFlightRef.current = true;
-    try {
-      const result = await fetcherRef.current();
-      setData(result);
-      setError(null);
-      setLastUpdated(Date.now());
-    } catch (err) {
-      setError(err);
-    } finally {
-      inFlightRef.current = false;
-      setLoading(false);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // We keep a ref to track the active request's device/dependency context
+  const activeEffectRef = useRef(0);
 
   useEffect(() => {
     if (!enabled) {
@@ -54,12 +38,63 @@ export default function usePolling(fetcher, { intervalMs = DEFAULT_INTERVAL_MS, 
       return undefined;
     }
 
-    setLoading(true);
-    tick();
-    const id = setInterval(tick, intervalMs);
-    return () => clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled, intervalMs, tick, ...deps]);
+    activeEffectRef.current += 1;
+    const currentEffectId = activeEffectRef.current;
 
-  return { data, error, loading, lastUpdated, refetch: tick };
+    // Reset data and set loading on dependency change to prevent showing stale device data
+    setData(null);
+    setLoading(true);
+
+    let inFlight = false;
+
+    const tick = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const result = await fetcherRef.current();
+        if (activeEffectRef.current === currentEffectId) {
+          setData(result);
+          setError(null);
+          setLastUpdated(Date.now());
+        }
+      } catch (err) {
+        if (activeEffectRef.current === currentEffectId) {
+          setError(err);
+        }
+      } finally {
+        inFlight = false;
+        if (activeEffectRef.current === currentEffectId) {
+          setLoading(false);
+        }
+      }
+    };
+
+    // Run immediately
+    tick();
+
+    // Setup interval
+    const intervalId = setInterval(tick, intervalMs);
+
+    return () => {
+      clearInterval(intervalId);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled, intervalMs, ...deps]);
+
+  // We expose a manual refetch function
+  const refetch = async () => {
+    try {
+      setLoading(true);
+      const result = await fetcherRef.current();
+      setData(result);
+      setError(null);
+      setLastUpdated(Date.now());
+    } catch (err) {
+      setError(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return { data, error, loading, lastUpdated, refetch };
 }

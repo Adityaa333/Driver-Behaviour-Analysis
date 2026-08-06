@@ -14,8 +14,15 @@ export const getDeviceStatus = async (deviceId) => {
  */
 export const getBackendHealth = async () => {
   const origin = API_BASE_URL.replace(/\/api\/v1\/?$/, '');
-  const { data } = await axios.get(`${origin}/health`, { timeout: 5000 });
-  return data;
+  try {
+    const { data } = await axios.get(`${origin}/health`, { timeout: 5000 });
+    return data;
+  } catch (err) {
+    if (err.response && err.response.data) {
+      return err.response.data;
+    }
+    throw err;
+  }
 };
 
 export default { getDeviceStatus, getBackendHealth };

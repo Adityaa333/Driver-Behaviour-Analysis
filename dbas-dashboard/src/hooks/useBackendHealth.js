@@ -12,8 +12,8 @@ export default function useBackendHealth() {
 
   return {
     // /health returns { database: "up"|"down", mqtt: "up"|"down", ... }
-    backendUp: !error && data?.database === 'up',
-    mqttUp: !error && data?.mqtt === 'up',
+    backendUp: data?.database === 'up',
+    mqttUp: data?.mqtt === 'up',
     raw: data,
     loading,
     error,

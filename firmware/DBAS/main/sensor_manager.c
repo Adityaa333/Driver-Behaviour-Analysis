@@ -147,6 +147,8 @@ static void sensor_manager_fusion_task(void *arg)
         merged.obd_speed_valid = obd_snapshot.vehicle_speed_valid;
         merged.throttle_position_pct = obd_snapshot.throttle_position_pct;
         merged.throttle_position_valid = obd_snapshot.throttle_position_valid;
+        merged.coolant_temp_c = obd_snapshot.coolant_temp_c;
+        merged.coolant_temp_valid = obd_snapshot.coolant_temp_valid;
 
         merged.timestamp_us = esp_timer_get_time();
 

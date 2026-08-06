@@ -78,6 +78,13 @@ esp_err_t gps_get_latest(gps_data_t *data);
  */
 int64_t gps_get_fix_age_ms(void);
 
+/**
+ * @brief Convenience helper used by status indicators: returns true when the
+ *        GPS has an active fix and meets minimum satellite count / HDOP
+ *        thresholds. Implemented in gps.c.
+ */
+bool gps_is_ready(void);
+
 #ifdef __cplusplus
 }
 #endif

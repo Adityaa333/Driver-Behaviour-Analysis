@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+E:/cdac-projects/firmwares/obd_simulator/build/CMakeFiles/bootloader
+E:/cdac-projects/firmwares/obd_simulator/build/CMakeFiles/bootloader.rule
+E:/cdac-projects/firmwares/obd_simulator/build/CMakeFiles/bootloader-complete.rule
+E:/cdac-projects/firmwares/obd_simulator/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+E:/cdac-projects/firmwares/obd_simulator/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+E:/cdac-projects/firmwares/obd_simulator/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+E:/cdac-projects/firmwares/obd_simulator/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+E:/cdac-projects/firmwares/obd_simulator/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+E:/cdac-projects/firmwares/obd_simulator/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+E:/cdac-projects/firmwares/obd_simulator/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule

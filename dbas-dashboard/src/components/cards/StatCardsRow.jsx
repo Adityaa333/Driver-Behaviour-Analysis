@@ -33,6 +33,7 @@ export default function StatCardsRow({ score, telemetry, scoreLoading, telemetry
   const rpm = telemetry?.engine_rpm_valid ? telemetry.engine_rpm : null;
   const throttle = telemetry?.throttle_position_valid ? telemetry.throttle_position_pct : null;
   const gpsSpeed = telemetry?.gps_fix_valid ? telemetry.gps_speed_kmh : null;
+  const coolantTemp = telemetry?.coolant_temp_valid ? telemetry.coolant_temp_c : null;
 
   return (
     <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4">
@@ -72,11 +73,12 @@ export default function StatCardsRow({ score, telemetry, scoreLoading, telemetry
       />
       <StatCard
         label="Engine Temperature"
-        value={null}
+        value={coolantTemp !== null ? coolantTemp : null}
+        unit="°C"
         icon={FireIcon}
-        tone="muted"
-        loading={false}
-        note="Not published in telemetry"
+        tone={coolantTemp !== null ? 'warning' : 'muted'}
+        loading={telemetryLoading}
+        note={coolantTemp === null ? 'Not available in the device telemetry payload' : null}
       />
       <StatCard
         label="GPS Speed"

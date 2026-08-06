@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { TruckIcon, ChevronDownIcon } from '@heroicons/react/24/outline';
+import { TruckIcon, ChevronDownIcon, ArrowPathIcon } from '@heroicons/react/24/outline';
 import { useDeviceContext } from '../../context/DeviceContext';
 import useBackendHealth from '../../hooks/useBackendHealth';
 import StatusDot from '../common/StatusDot';
@@ -120,6 +120,14 @@ export default function TopNav() {
 
         <div className="flex items-center gap-3">
           <DevicePicker />
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-[var(--color-border)] hover:border-[var(--color-accent)]/50 transition-colors text-[var(--color-text-secondary)]"
+          >
+            <ArrowPathIcon className="w-4 h-4 text-[var(--color-accent)]" />
+            <span className="text-xs">Refresh</span>
+          </button>
           <div className="hidden sm:flex flex-col items-end leading-none">
             <span className="text-[10px] text-[var(--color-text-muted)] mb-1">Last Updated</span>
             <LiveClock />

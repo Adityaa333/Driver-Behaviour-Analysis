@@ -123,6 +123,8 @@ class TelemetryOut(BaseModel):
     obd_speed_kmh: Optional[float] = None
     throttle_position_valid: Optional[bool] = None
     throttle_position_pct: Optional[float] = None
+    coolant_temp_valid: Optional[bool] = None
+    coolant_temp_c: Optional[int] = None
 
 
 class ScoreOut(BaseModel):
@@ -226,16 +228,21 @@ def _paging(limit: int, offset: int) -> tuple[int, int]:
     return min(limit, MAX_PAGE_SIZE), offset
 
 
-def _rating_for_score(score: float) -> str:
+def _effective_ts(timestamp_ms: Optional[int], received_at: Optional[datetime]) -> int:
     """
-    Buckets a numeric score into the same tiers dashboard/flow.json's
-    gauge already visualizes (seg1=50, seg2=80 on node_gauge_score).
+    Ensures timestamp_ms is a valid epoch timestamp (>= Sept 2001).
+    If it's missing, 0, or an uptime-based value (small integer),
+    falls back to received_at epoch milliseconds so UI components
+    always receive a real wall-clock date/time.
     """
-    if score >= 80:
-        return "Excellent"
-    if score >= 50:
-        return "Fair"
-    return "Poor"
+    if timestamp_ms is not None and timestamp_ms >= 1000000000000:
+        return int(timestamp_ms)
+    if received_at is not None:
+        try:
+            return int(received_at.timestamp() * 1000)
+        except Exception:
+            pass
+    return int(datetime.now().timestamp() * 1000)
 
 
 def _severity_and_message_for_alert(record: AlertRecord) -> tuple[str, str]:
@@ -267,6 +274,15 @@ def _severity_and_message_for_alert(record: AlertRecord) -> tuple[str, str]:
     # the response.
     logger.warning("Unexpected alert_type '%s' from device %s", record.alert_type, record.device_id)
     return "Low", f"Alert: {record.alert_type}"
+
+
+def _rating_for_score(score: float) -> str:
+    """Converts a numeric safety score into the dashboard's rating buckets."""
+    if score >= 80:
+        return "Excellent"
+    if score >= 50:
+        return "Fair"
+    return "Poor"
 
 
 def _get_device_or_404(db: Session, device_id: str) -> Device:
@@ -333,14 +349,17 @@ def get_device_telemetry(
 
     def query():
         _get_device_or_404(db, device_id)
-        return (
+        records = (
             db.query(TelemetryRecord)
             .filter(TelemetryRecord.device_id == device_id)
-            .order_by(desc(TelemetryRecord.timestamp_ms))
+            .order_by(desc(TelemetryRecord.timestamp_ms), desc(TelemetryRecord.id))
             .offset(offset)
             .limit(limit)
             .all()
         )
+        for r in records:
+            r.timestamp_ms = _effective_ts(r.timestamp_ms, r.received_at)
+        return records
 
     return _run_query(db, "get_device_telemetry", query)
 
@@ -360,13 +379,16 @@ def get_device_latest_telemetry(
 
     def query():
         _get_device_or_404(db, device_id)
-        return (
+        records = (
             db.query(TelemetryRecord)
             .filter(TelemetryRecord.device_id == device_id)
-            .order_by(desc(TelemetryRecord.timestamp_ms))
+            .order_by(desc(TelemetryRecord.timestamp_ms), desc(TelemetryRecord.id))
             .limit(limit)
             .all()
         )
+        for r in records:
+            r.timestamp_ms = _effective_ts(r.timestamp_ms, r.received_at)
+        return records
 
     return _run_query(db, "get_device_latest_telemetry", query)
 
@@ -395,7 +417,7 @@ def get_latest_score(device_id: str, db: Session = Depends(get_db)) -> ScoreOut:
         record = (
             db.query(ScoreRecord)
             .filter(ScoreRecord.device_id == device_id)
-            .order_by(desc(ScoreRecord.timestamp_ms))
+            .order_by(desc(ScoreRecord.timestamp_ms), desc(ScoreRecord.id))
             .first()
         )
         if record is None:
@@ -405,7 +427,7 @@ def get_latest_score(device_id: str, db: Session = Depends(get_db)) -> ScoreOut:
             )
         return ScoreOut(
             device_id=record.device_id,
-            timestamp_ms=record.timestamp_ms,
+            timestamp_ms=_effective_ts(record.timestamp_ms, record.received_at),
             score=record.score,
             rating=_rating_for_score(record.score),
             harsh_braking_count=record.harsh_braking_count,
@@ -440,7 +462,7 @@ def get_score_history(
         records = (
             db.query(ScoreRecord)
             .filter(ScoreRecord.device_id == device_id)
-            .order_by(desc(ScoreRecord.timestamp_ms))
+            .order_by(desc(ScoreRecord.timestamp_ms), desc(ScoreRecord.id))
             .offset(offset)
             .limit(limit)
             .all()
@@ -448,7 +470,7 @@ def get_score_history(
         return [
             ScoreOut(
                 device_id=r.device_id,
-                timestamp_ms=r.timestamp_ms,
+                timestamp_ms=_effective_ts(r.timestamp_ms, r.received_at),
                 score=r.score,
                 rating=_rating_for_score(r.score),
                 harsh_braking_count=r.harsh_braking_count,
@@ -493,7 +515,7 @@ def get_device_alerts(
         records = (
             db.query(AlertRecord)
             .filter(AlertRecord.device_id == device_id)
-            .order_by(desc(AlertRecord.timestamp_ms))
+            .order_by(desc(AlertRecord.timestamp_ms), desc(AlertRecord.id))
             .offset(offset)
             .limit(limit)
             .all()
@@ -503,7 +525,7 @@ def get_device_alerts(
             severity, message = _severity_and_message_for_alert(r)
             result.append(
                 AlertOut(
-                    timestamp_ms=r.timestamp_ms,
+                    timestamp_ms=_effective_ts(r.timestamp_ms, r.received_at),
                     alert_type=r.alert_type,
                     raw_payload_json=r.raw_payload_json,
                     severity=severity,
@@ -537,14 +559,14 @@ def list_alerts(
             q = q.filter(AlertRecord.device_id == device_id)
         if alert_type is not None:
             q = q.filter(AlertRecord.alert_type == alert_type)
-        records = q.order_by(desc(AlertRecord.timestamp_ms)).offset(offset).limit(limit).all()
+        records = q.order_by(desc(AlertRecord.timestamp_ms), desc(AlertRecord.id)).offset(offset).limit(limit).all()
 
         result = []
         for r in records:
             severity, message = _severity_and_message_for_alert(r)
             result.append(
                 AlertOut(
-                    timestamp_ms=r.timestamp_ms,
+                    timestamp_ms=_effective_ts(r.timestamp_ms, r.received_at),
                     alert_type=r.alert_type,
                     raw_payload_json=r.raw_payload_json,
                     severity=severity,
@@ -576,20 +598,33 @@ def get_device_crashes(
     limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-) -> List[CrashRecord]:
+) -> List[CrashOut]:
     """Returns confirmed crash events for a device, most recent first."""
     limit, offset = _paging(limit, offset)
 
     def query():
         _get_device_or_404(db, device_id)
-        return (
+        records = (
             db.query(CrashRecord)
             .filter(CrashRecord.device_id == device_id)
-            .order_by(desc(CrashRecord.timestamp_ms))
+            .order_by(desc(CrashRecord.timestamp_ms), desc(CrashRecord.id))
             .offset(offset)
             .limit(limit)
             .all()
         )
+        return [
+            CrashOut(
+                id=r.id,
+                device_id=r.device_id,
+                timestamp_ms=_effective_ts(r.timestamp_ms, r.received_at),
+                total_accel_g=r.total_accel_g,
+                total_gyro_dps=r.total_gyro_dps,
+                latitude_deg=r.latitude_deg,
+                longitude_deg=r.longitude_deg,
+                speed_kmh=r.speed_kmh,
+            )
+            for r in records
+        ]
 
     return _run_query(db, "get_device_crashes", query)
 
@@ -602,16 +637,16 @@ def get_device_crashes(
     response_model=StatusOut,
     tags=["status"],
 )
-def get_device_latest_status(device_id: str, db: Session = Depends(get_db)) -> StatusRecord:
+def get_device_latest_status(device_id: str, db: Session = Depends(get_db)) -> StatusOut:
     """Returns the most recent health/status snapshot for a device
     (uptime, heap, WiFi/MQTT connectivity, RSSI, current score)."""
 
-    def query():
+    def query() -> StatusOut:
         _get_device_or_404(db, device_id)
         record = (
             db.query(StatusRecord)
             .filter(StatusRecord.device_id == device_id)
-            .order_by(desc(StatusRecord.timestamp_ms))
+            .order_by(desc(StatusRecord.timestamp_ms), desc(StatusRecord.id))
             .first()
         )
         if record is None:
@@ -619,6 +654,16 @@ def get_device_latest_status(device_id: str, db: Session = Depends(get_db)) -> S
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"No status has been published yet for device '{device_id}'.",
             )
-        return record
+        return StatusOut(
+            device_id=record.device_id,
+            timestamp_ms=_effective_ts(record.timestamp_ms, record.received_at),
+            uptime_sec=record.uptime_sec,
+            free_heap_bytes=record.free_heap_bytes,
+            min_free_heap_bytes=record.min_free_heap_bytes,
+            wifi_connected=record.wifi_connected,
+            mqtt_connected=record.mqtt_connected,
+            wifi_rssi_dbm=record.wifi_rssi_dbm,
+            current_driver_score=record.current_driver_score,
+        )
 
     return _run_query(db, "get_device_latest_status", query)

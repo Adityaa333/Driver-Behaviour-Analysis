@@ -27,7 +27,7 @@ extern "C" {
  * Firmware Identification
  * ------------------------------------------------------------------------- */
 #define FIRMWARE_VERSION_MAJOR         3
-#define FIRMWARE_VERSION_MINOR         0
+#define FIRMWARE_VERSION_MINOR         1
 #define FIRMWARE_VERSION_PATCH         1
 #define DEVICE_TYPE_STRING             "DBAS-ESP32"
 #define DEVICE_ID_MAX_LEN              32   /* Derived from MAC at runtime */
@@ -41,8 +41,8 @@ extern "C" {
  * defined here as macros to keep this reference implementation
  * self-contained and fully compilable out of the box.
  * ------------------------------------------------------------------------- */
-#define WIFI_SSID                      "Amber"
-#define WIFI_PASSWORD                  "123456789@"
+#define WIFI_SSID                      "C-1006_5GHz"
+#define WIFI_PASSWORD                  "duc@tiM796"
 #define WIFI_MAX_RETRY_COUNT           10
 #define WIFI_RECONNECT_DELAY_MS        5000
 #define WIFI_CONNECT_TIMEOUT_MS        15000
@@ -50,7 +50,7 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * MQTT Configuration
  * ------------------------------------------------------------------------- */
-#define MQTT_BROKER_URI                "mqtt://192.168.1.20:1883"
+#define MQTT_BROKER_URI                "mqtt://192.168.1.2:1883"
 #define MQTT_CLIENT_ID_PREFIX          "dbas_"
 #define MQTT_KEEPALIVE_SEC             60
 #define MQTT_QOS_TELEMETRY             1
@@ -59,7 +59,7 @@ extern "C" {
 #define MQTT_QOS_STATUS                1
 #define MQTT_RECONNECT_TIMEOUT_MS      10000
 #define MQTT_MAX_TOPIC_LEN             64
-#define MQTT_MAX_PAYLOAD_LEN           512
+#define MQTT_MAX_PAYLOAD_LEN           786
 
 /* MQTT topic format strings; each is formatted at runtime with the
  * device's unique ID (e.g. "fleet/AABBCCDDEEFF/telemetry"). */
@@ -91,6 +91,13 @@ extern "C" {
 #define GPS_SAMPLE_PERIOD_MS            1000    /* 1 Hz, typical NMEA rate */
 #define GPS_NMEA_MAX_SENTENCE_LEN       128
 
+/* LED / GPS readiness thresholds used by led_indicator.c */
+#define LED_STATUS_GPIO                 2
+#define GPS_READY_MIN_SATELLITES        4
+#define GPS_READY_MAX_HDOP              5.0f
+#define LED_CHECK_PERIOD_MS             500
+
+
 /* ---------------------------------------------------------------------------
  * TWAI (CAN) / OBD-II Configuration
  * ------------------------------------------------------------------------- */
@@ -106,6 +113,7 @@ extern "C" {
  * ------------------------------------------------------------------------- */
 
 #define OBD_BT_TARGET_MAC              { 0x96, 0x02, 0x00, 0x11, 0x1E, 0x66 }  /* your dongle's MAC */
+#define OBD_BLE_TARGET_NAME             "OBDII" // Dongle name 
 #define OBD_BT_SPP_SCN                 1
 #define OBD_BT_CONNECT_TIMEOUT_MS      8000
 #define OBD_BT_RECONNECT_DELAY_MS      3000
@@ -135,6 +143,7 @@ extern "C" {
 #define TASK_PRIORITY_GEOFENCE          5
 #define TASK_PRIORITY_MQTT_PUBLISH      4
 #define TASK_PRIORITY_WIFI_MANAGER      3
+#define TASK_PRIORITY_LED_INDICATOR     2
 
 /* ---------------------------------------------------------------------------
  * Task Stack Sizes (bytes)
@@ -148,6 +157,11 @@ extern "C" {
 #define TASK_STACK_SIZE_GEOFENCE        3072
 #define TASK_STACK_SIZE_MQTT_PUBLISH    4608
 #define TASK_STACK_SIZE_WIFI_MANAGER    4096
+#define TASK_STACK_SIZE_LED_INDICATOR   2048
+
+#define TASK_PRIORITY_CRASH_DETECTION   9
+#define TASK_PRIORITY_MPU6050           7
+#define TASK_PRIORITY_DRIVER_SCORE      6
 
 /* ---------------------------------------------------------------------------
  * Task Core Pinning (ESP32 is dual-core: PRO_CPU=0, APP_CPU=1)

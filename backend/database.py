@@ -36,6 +36,8 @@ from sqlalchemy import (
     Text,
     ForeignKey,
     Index,
+    inspect,
+    text,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
@@ -48,7 +50,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./dbas.db")
 # api.py reads from FastAPI's request-handling threads/event loop. This
 # flag has no effect on non-SQLite backends and is safe to leave in
 # place if DATABASE_URL is changed.
-_engine_kwargs = {"connect_args": {"check_same_thread": False}} if DATABASE_URL.startswith("sqlite") else {}
+_engine_kwargs = {"connect_args": {"check_same_thread": False, "timeout": 15.0}} if DATABASE_URL.startswith("sqlite") else {}
 
 engine = create_engine(DATABASE_URL, **_engine_kwargs)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -110,6 +112,8 @@ class TelemetryRecord(Base):
     obd_speed_kmh = Column(Float, nullable=True)
     throttle_position_valid = Column(Boolean, nullable=True)
     throttle_position_pct = Column(Float, nullable=True)
+    coolant_temp_valid = Column(Boolean, nullable=True)
+    coolant_temp_c = Column(Integer, nullable=True)
 
     received_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
@@ -245,6 +249,23 @@ def init_db() -> None:
     so it is not a substitute for a real migration tool (e.g. Alembic)
     if the schema changes after data has been collected."""
     Base.metadata.create_all(bind=engine)
+
+    # Add new telemetry columns to existing databases when possible.
+    inspector = inspect(engine)
+    if 'telemetry_records' in inspector.get_table_names():
+        existing_columns = {col['name'] for col in inspector.get_columns('telemetry_records')}
+        alter_stmts = []
+        if 'coolant_temp_valid' not in existing_columns:
+            alter_stmts.append('coolant_temp_valid BOOLEAN')
+        if 'coolant_temp_c' not in existing_columns:
+            alter_stmts.append('coolant_temp_c INTEGER')
+        if alter_stmts:
+            with engine.connect() as conn:
+                with conn.begin():
+                    for stmt in alter_stmts:
+                        conn.execute(text(f'ALTER TABLE telemetry_records ADD COLUMN {stmt}'))
+            logger.info('Added missing telemetry columns: %s', ', '.join(stmt.split()[0] for stmt in alter_stmts))
+
     logger.info("Database schema initialized (%s)", DATABASE_URL)
 
 
@@ -310,6 +331,8 @@ def insert_telemetry(session: Session, device_id: str, payload: dict) -> None:
         obd_speed_kmh=payload.get("obd_speed_kmh"),
         throttle_position_valid=payload.get("throttle_position_valid"),
         throttle_position_pct=payload.get("throttle_position_pct"),
+        coolant_temp_valid=payload.get("coolant_temp_valid"),
+        coolant_temp_c=payload.get("coolant_temp_c"),
     )
     session.add(record)
 

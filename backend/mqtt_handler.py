@@ -25,6 +25,7 @@ literal string "fleet" being hardcoded.
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 import paho.mqtt.client as mqtt
@@ -166,6 +167,22 @@ class MQTTIngestHandler:
         if not isinstance(payload, dict):
             logger.error("Payload on topic %s is not a JSON object, discarding", topic)
             return
+
+        # Normalize timestamp_ms: ESP32 firmware often publishes uptime-based milliseconds
+        # (e.g. 5000 for 5s since boot) rather than real Unix epoch milliseconds. If it's
+        # too small (< 1000000000000 ms, which is Sept 2001) or missing/zero, override it
+        # with current UTC epoch ms so charts, maps, and UI timestamps render correctly.
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        ts = payload.get("timestamp_ms")
+        if not isinstance(ts, (int, float)) or ts < 1000000000000:
+            payload["timestamp_ms"] = now_ms
+            if message_type == "alert":
+                try:
+                    alert_dict = json.loads(payload_str)
+                    alert_dict["timestamp_ms"] = now_ms
+                    payload_str = json.dumps(alert_dict)
+                except Exception:
+                    pass
 
         session = get_session()
         try:

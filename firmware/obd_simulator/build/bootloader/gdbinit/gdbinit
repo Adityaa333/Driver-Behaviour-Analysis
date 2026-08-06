@@ -1,0 +1,2 @@
+source E:/cdac-projects/firmwares/obd_simulator/build/bootloader/gdbinit/symbols
+source E:/cdac-projects/firmwares/obd_simulator/build/bootloader/gdbinit/connect

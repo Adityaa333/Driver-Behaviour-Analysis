@@ -1,0 +1,115 @@
+p: 0, SPIWP:��� Partition Table:
+[0;32mI (51) boot: ## Label            Usage          Type ST Offset   Length[0m
+[0;32mI (57) boot:  0 nvs              WiFi data        01 02 00009000 00006000[0m
+[0;32mI (63) boot:  1 phy_init  �ets Jun  8 2016 00:22:57[0m
+
+rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+configsip: 0, SPIWP:0xee
+clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
+mode:DIO, clock div:2
+load:0x3fff0030,len:6280
+load:0x40078000,len:15736
+load:0x40080400,len:4
+load:0x40080404,len:3920
+entry 0x40080648
+[0;32mI (29) boot: ESP-IDF v5.4.4 2nd stage bootloader[0m
+[0;32mI (29) boot: compile time Aug  5 2026 22:26:10[0m
+[0;32mI (29) boot: Multicore bootloader[0m
+[0;32mI (30) boot: chip revision: v1.0[0m
+[0;32mI (33) boot.esp32: SPI Speed      : 40MHz[0m
+[0;32mI (36) boot.esp32: SPI Mode       : DIO[0m
+[0;32mI (40) boot.esp32: SPI Flash Size : 4MB[0m
+[0;32mI (44) boot: Enabling RNG early entropy source...[0m
+[0;32mI (48) boot: Partition Table:[0m
+[0;32mI (51) boot: ## Label            Usage          Type ST Offset   Length[0m
+[0;32mI (57) boot:  0 nvs              WiFi data        01 02 00009000 00006000[0m
+[0;32mI (64) boot:  1 phy_init         RF data          01 01 0000f000 00001000[0m
+[0;32mI (70) boot:  2 factory          factory app      00 00 00010000 00100000[0m
+[0;32mI (77) boot: End of partition table[0m
+[0;32mI (80) esp_image: segment 0: paddr=00010020 vaddr=3f400020 size=129f0h ( 76272) map[0m
+[0;32mI (113) esp_image: segment 1: paddr=00022a18 vaddr=3ffbdb60 size=04d80h ( 19840) load[0m
+[0;32mI (121) esp_image: segment 2: paddr=000277a0 vaddr=40080000 size=08878h ( 34936) load[0m
+[0;32mI (135) esp_image: segment 3: paddr=00030020 vaddr=400d0020 size=45dd8h (286168) map[0m
+[0;32mI (233) esp_image: segment 4: paddr=00075e00 vaddr=40088878 size=104d8h ( 66776) load[0m
+[0;32mI (259) esp_image: segment 5: paddr=000862e0 vaddr=50000000 size=0001ch (    28) load[0m
+[0;32mI (271) boot: Loaded app from partition at offset 0x10000[0m
+[0;32mI (271) boot: Disabling RNG early entropy source...[0m
+[0;32mI (282) cpu_start: Multicore app[0m
+[0;32mI (290) cpu_start: GPIO 3 and 1 are used as console UART I/O pins[0m
+[0;32mI (290) cpu_start: Pro cpu start user code[0m
+[0;32mI (290) cpu_start: cpu freq: 160000000 Hz[0m
+[0;32mI (292) app_init: Application information:[0m
+[0;32mI (296) app_init: Project name:     obd_simulator[0m
+[0;32mI (300) app_init: App version:      1[0m
+[0;32mI (304) app_init: Compile time:     Aug  5 2026 22:25:26[0m
+[0;32mI (309) app_init: ELF file SHA256:  a72c39347...[0m
+[0;32mI (313) app_init: ESP-IDF:          v5.4.4[0m
+[0;32mI (317) efuse_init: Min chip rev:     v0.0[0m
+[0;32mI (321) efuse_init: Max chip rev:     v3.99 [0m
+[0;32mI (325) efuse_init: Chip rev:         v1.0[0m
+[0;32mI (329) heap_init: Initializing. RAM available for dynamic allocation:[0m
+[0;32mI (335) heap_init: At 3FFAFF10 len 000000F0 (0 KiB): DRAM[0m
+[0;32mI (340) heap_init: At 3FFB6388 len 00001C78 (7 KiB): DRAM[0m
+[0;32mI (345) heap_init: At 3FFB9A20 len 00004108 (16 KiB): DRAM[0m
+[0;32mI (350) heap_init: At 3FFC4168 len 0001BE98 (111 KiB): DRAM[0m
+[0;32mI (355) heap_init: At 3FFE0440 len 00003AE0 (14 KiB): D/IRAM[0m
+[0;32mI (361) heap_init: At 3FFE4350 len 0001BCB0 (111 KiB): D/IRAM[0m
+[0;32mI (366) heap_init: At 40098D50 len 000072B0 (28 KiB): IRAM[0m
+[0;32mI (373) spi_flash: detected chip: generic[0m
+[0;32mI (375) spi_flash: flash io: dio[0m
+[0;32mI (379) coexist: coex firmware version: 2de0784[0m
+[0;32mI (383) main_task: Started on CPU0[0m
+[0;32mI (393) main_task: Calling app_main()[0m
+[0;32mI (393) main: ========================================[0m
+[0;32mI (393) main:  ELM327 BLE OBD-II Simulator[0m
+[0;32mI (393) main:  (for DBAS firmware testing)[0m
+[0;32mI (393) main: ========================================[0m
+[0;32mI (453) pid_generator: PID generator tick task started (period=100ms)[0m
+[0;32mI (453) pid_generator: PID generator initialized (warm idle defaults)[0m
+[0;32mI (453) scenario_manager: Waypoint task started (initial scenario: Idl[0m
+--- OBD-II Simulator: Driving Scenario ---
+  0 / idle       - Idle
+  1 / city       - City Driving
+  2 / highway    - Highway
+  3 / aggressive - Aggressive Driving
+  4 / fault      - Engine Fault
+Type a number or name and press Enter to switch. Current: Idle
+> I (473) gpio: GPIO[0]| InputEn: 1| OutputEn: 0| OpenDrain: 0| Pullup: 1| Pulldown: 0| Intr:0 
+[0;32mI (503) scenario_manager: Button task started (GPIO0, active-low, cycles scenarios forward)[0m
+[0;32mI (473) scenario_manager: Scenario manager initialized (default scenario: Idle)[0m
+[0;32mI (513) elm327_sim: Bluetooth MAC overridden to match DBAS's OBD_BT_TARGET_MAC[0m
+[0;32mI (513) BTDM_INIT: BT controller compile version [440e0f9][0m
+[0;32mI (533) BTDM_INIT: Using main XTAL as clock source[0m
+[0;32mI (533) BTDM_INIT: Bluetooth MAC: 66:1e:11:00:02:96[0m
+[0;32mI (533) phy_init: phy_version 4863,a3a4459,Oct 28 2025,14:30:06[0m
+[0;32mI (843) elm327_sim: Command processing task started[0m
+[0;32mI (853) elm327_sim: ELM327 BLE simulator initialized[0m
+[0;32mI (853) main: Simulator running; advertising as BLE OBD-II adapter[0m
+[0;32mI (863) main_task: Returned from app_main()[0m
+[0;33mW (883) NimBLE: Failed to persist local IRK (rc=8)[0m
+[0;32mI (893) NimBLE: GAP procedure initiated: advertise; [0m
+[0;32mI (893) NimBLE: disc_mode=2[0m
+[0;32mI (903) NimBLE:  adv_channel_map=0 own_addr_type=0 adv_filter_policy=0 adv_itvl_min=0 adv_itvl_max=0[0m
+[0;32mI (913) NimBLE: [0m
+
+[0;32mI (913) elm327_sim: Advertising started as 'OBDII'[0m
+[0;32mI (1783) elm327_sim: DBAS connected, conn_handle=0[0m
+[0;32mI (1883) elm327_sim: ATT MTU negotiated: 256[0m
+[0;32mI (3073) elm327_sim: DBAS disconnected, reason=531 - restarting advertising[0m
+[0;32mI (3083) NimBLE: GAP procedure initiated: advertise; [0m
+[0;32mI (3083) NimBLE: disc_mode=2[0m
+[0;32mI (3083) NimBLE:  adv_channel_map=0 own_addr_type=0 adv_filter_policy=0 adv_itvl_min=0 adv_itvl_max=0[0m
+[0;32mI (3093) NimBLE: [0m
+
+[0;32mI (3103) elm327_sim: Advertising started as 'OBDII'[0m
+[0;32mI (4043) scenario_manager: [Idle] waypoint: rpm=795 speed=0.0km/h coolant=90C throttle=0.0% (ramp=3.6s, next in 5.3s)[0m
+[0;32mI (6033) elm327_sim: DBAS connected, conn_handle=0[0m
+[0;32mI (6133) elm327_sim: ATT MTU negotiated: 256[0m
+[0;32mI (7583) elm327_sim: DBAS disconnected, reason=531 - restarting advertising[0m
+[0;32mI (7583) NimBLE: GAP procedure initiated: advertise; [0m
+[0;32mI (7583) NimBLE: disc_mode=2[0m
+[0;32mI (7583) NimBLE:  adv_channel_map=0 own_addr_type=0 adv_filter_policy=0 adv_itvl_min=0 adv_itvl_max=0[0m
+[0;32mI (7603) NimBLE: [0m
+
+[0;32mI (7603) elm327_sim: Advertising started as 'OBDII'[0m
+[0;32mI (9443) scenario_manager: [Idle] waypoint: rpm=786 speed=0.0km/h coolant=88C throttle=0.0% (ramp=3.0s, next in 4.0s)[0m

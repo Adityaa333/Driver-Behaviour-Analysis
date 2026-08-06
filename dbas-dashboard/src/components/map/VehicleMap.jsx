@@ -1,11 +1,12 @@
 import { useEffect, useRef } from 'react';
-import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, useMap, Circle } from 'react-leaflet';
 import L from 'leaflet';
 import { MapPinIcon } from '@heroicons/react/24/outline';
 import ErrorState from '../common/ErrorState';
 import { formatTime, roundTo } from '../../utils/formatters';
 
 const DEFAULT_CENTER = [18.535229, 73.811121]; // Falls back to the firmware's default geofence center (app_main.c)
+const GEOFENCE_RADIUS_METERS = 1000;
 
 const vehicleIcon = L.divIcon({
   className: '',
@@ -53,6 +54,16 @@ export default function VehicleMap({ telemetry, loading }) {
         <TileLayer
           url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
           attribution='&copy; <a href="https://carto.com/attributions">CARTO</a> &copy; OpenStreetMap contributors'
+        />
+        <Circle
+          center={DEFAULT_CENTER}
+          radius={GEOFENCE_RADIUS_METERS}
+          pathOptions={{
+            color: '#FBBF24',
+            fillColor: '#FDE68A',
+            fillOpacity: 0.15,
+            dashArray: '4',
+          }}
         />
         {position && (
           <>

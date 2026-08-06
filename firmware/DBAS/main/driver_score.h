@@ -65,6 +65,8 @@ typedef struct {
     bool obd_speed_valid;
     float throttle_position_pct;
     bool throttle_position_valid;
+    int16_t coolant_temp_c;         /*!< Engine coolant temperature, Celsius */
+    bool coolant_temp_valid;
 
     int64_t timestamp_us;
 } vehicle_sample_t;

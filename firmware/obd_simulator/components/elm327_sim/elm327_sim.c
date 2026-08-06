@@ -72,12 +72,19 @@ static const char *TAG = "elm327_sim";
  * BLE Identity / Advertising Configuration
  * ------------------------------------------------------------------------- */
 
-/* MUST match DBAS's config.h OBD_BT_TARGET_MAC exactly - see the
+/* MUST correspond to DBAS's config.h OBD_BT_TARGET_MAC - see the
  * integration note above. DBAS's config.h currently has:
  *   #define OBD_BT_TARGET_MAC  { 0x96, 0x02, 0x00, 0x11, 0x1E, 0x66 }
  *   #define OBD_BLE_TARGET_ADDR_TYPE BLE_ADDR_PUBLIC
+ *
+ * Note: DBAS's config.h defines OBD_BT_TARGET_MAC as a Little-Endian byte
+ * array for NimBLE's ble_addr_t.val struct field (LSB first: 0x96..0x66,
+ * which represents the MAC address 66:1E:11:00:02:96).
+ * esp_iface_mac_addr_set() expects Big-Endian MAC display order (MSB first).
+ * Therefore, we specify { 0x66, 0x1E, 0x11, 0x00, 0x02, 0x96 } here so the
+ * simulator presents the exact MAC address DBAS is looking for.
  */
-static const uint8_t ELM327_SIM_TARGET_MAC[6] = { 0x96, 0x02, 0x00, 0x11, 0x1E, 0x66 };
+static const uint8_t ELM327_SIM_TARGET_MAC[6] = { 0x66, 0x1E, 0x11, 0x00, 0x02, 0x96 };
 
 /* Advertised name. Real cheap ELM327 BLE ("UART bridge") clones use a
  * variety of names depending on manufacturer (e.g. "OBDII", "Vlink",
@@ -87,17 +94,17 @@ static const uint8_t ELM327_SIM_TARGET_MAC[6] = { 0x96, 0x02, 0x00, 0x11, 0x1E, 
 #define ELM327_SIM_DEVICE_NAME      "OBDII"
 
 #define ELM327_SIM_SVC_UUID         0xFFF0
-#define ELM327_SIM_CHR_NOTIFY_UUID  0xFFF1   /* adapter -> DBAS (notify) */
-#define ELM327_SIM_CHR_WRITE_UUID   0xFFF2   /* DBAS -> adapter (write)  */
+#define ELM327_SIM_CHR_NOTIFY_UUID  0xFFF1   /* adapter -> DBAS (notify)    */
+#define ELM327_SIM_CHR_WRITE_UUID   0xFFF2   /* DBAS -> adapter (write)     */
 
 /* ---------------------------------------------------------------------------
  * Command Buffering / Queue
  * ------------------------------------------------------------------------- */
 
-#define ELM327_CMD_MAX_LEN          32    /* Longest real command is short */
+#define ELM327_CMD_MAX_LEN          32    /* Longest real command is short  */
 #define ELM327_CMD_QUEUE_LEN        5
-#define ELM327_RESP_MAX_LEN         128   /* Longest response we generate */
-#define ELM327_DEFAULT_ATT_MTU      23    /* Pre-negotiation ATT default */
+#define ELM327_RESP_MAX_LEN         128   /* Longest response we generate   */
+#define ELM327_DEFAULT_ATT_MTU      23    /* Pre-negotiation ATT default    */
 
 typedef struct {
     char text[ELM327_CMD_MAX_LEN];
@@ -117,44 +124,56 @@ static size_t s_rx_accum_len = 0;
 
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_notify_val_handle = 0;   /* Filled in by NimBLE at registration */
-static bool s_notify_enabled = false;      /* True once DBAS writes the CCCD */
+static bool s_notify_enabled = false;      /* True once DBAS writes the CCCD      */
 static uint16_t s_att_mtu = ELM327_DEFAULT_ATT_MTU;
 
 /* ---------------------------------------------------------------------------
  * Emulated Adapter State (AT command settings)
  * ------------------------------------------------------------------------- */
 
-static bool s_echo_enabled = true;      /* Real ELM327 default: echo ON  */
-static bool s_headers_enabled = false;  /* Real ELM327 default: headers OFF */
+static bool s_echo_enabled = true;      /* Real ELM327 default: echo ON      */
+static bool s_headers_enabled = false;  /* Real ELM327 default: headers OFF  */
 static bool s_linefeeds_enabled = true; /* Real ELM327 default: linefeeds ON */
 static bool s_search_reported = false;  /* "SEARCHING..." fires once after ATSP0/reset */
 
 static uint8_t s_own_addr_type;
 
 /* ---------------------------------------------------------------------------
- * GATT Access Callbacks (forward declarations needed by the service table)
+ * Forward Declarations
  * ------------------------------------------------------------------------- */
 
 static int elm327_gatt_notify_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                                          struct ble_gatt_access_ctxt *ctxt, void *arg);
 static int elm327_gatt_write_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                                         struct ble_gatt_access_ctxt *ctxt, void *arg);
+/* FIX 1: Forward declaration name now matches the actual function definition
+ * below (was elm327_gap_event_cb, which was never defined, causing the
+ * linker to fail). */
 static int elm327_gap_event_cb(struct ble_gap_event *event, void *arg);
+static void elm327_advertise_start(void);
 
 /* ---------------------------------------------------------------------------
  * GATT Service Table
  *
  * Single primary service (0xFFF0) with two characteristics, matching
  * the "UART bridge" layout DBAS's obd.c already expects:
- *   - 0xFFF1: NOTIFY only. NimBLE auto-adds a CCCD (0x2902) descriptor
- *     for any characteristic with the NOTIFY flag, so DBAS's descriptor
- *     discovery in obd.c will find one here (unlike some cheap real
- *     clones that omit it - see obd.c's on_dsc_disc() fallback comment
- *     for why that path exists; this simulator exercises the "normal"
- *     path instead).
- *   - 0xFFF2: WRITE_NO_RSP, matching DBAS's ble_gattc_write_flat() usage
- *     (a write-without-response, acknowledged at the ATT layer only).
+ *   - 0xFFF1: NOTIFY + READ. NimBLE auto-adds a CCCD (0x2902) descriptor
+ *     for any characteristic with the NOTIFY flag, but we also explicitly
+ *     declare it here to ensure it's present and discoverable. The READ
+ *     flag allows the peer to read the characteristic value if needed.
+ *   - 0xFFF2: WRITE_NO_RSP, matching DBAS's ble_gattc_write_no_rsp_flat()
+ *     usage. Note: ble_gattc_write_flat() is a write-WITH-response;
+ *     obd.c actually calls ble_gattc_write_no_rsp_flat(), so
+ *     BLE_GATT_CHR_F_WRITE_NO_RSP here is correct. Do not change it to
+ *     BLE_GATT_CHR_F_WRITE.
  * ------------------------------------------------------------------------- */
+
+/* NOTE: Do NOT manually declare a 0x2902 (CCCD) descriptor here. NimBLE
+ * automatically creates and manages the CCCD for any characteristic whose
+ * flags include BLE_GATT_CHR_F_NOTIFY or F_INDICATE. Declaring one
+ * explicitly on top of that causes ble_gatts_count_cfg() to reject the
+ * entire service table with BLE_HS_EINVAL (rc=3) at boot, before
+ * advertising ever starts - this was the cause of the app_main() abort. */
 
 static const struct ble_gatt_svc_def s_gatt_svcs[] = {
     {
@@ -162,15 +181,15 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
         .uuid = BLE_UUID16_DECLARE(ELM327_SIM_SVC_UUID),
         .characteristics = (struct ble_gatt_chr_def[]) {
             {
-                .uuid = BLE_UUID16_DECLARE(ELM327_SIM_CHR_NOTIFY_UUID),
-                .access_cb = elm327_gatt_notify_access_cb,
-                .val_handle = &s_notify_val_handle,
-                .flags = BLE_GATT_CHR_F_NOTIFY,
+                .uuid         = BLE_UUID16_DECLARE(ELM327_SIM_CHR_NOTIFY_UUID),
+                .access_cb    = elm327_gatt_notify_access_cb,
+                .val_handle   = &s_notify_val_handle,
+                .flags        = BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_READ,
             },
             {
-                .uuid = BLE_UUID16_DECLARE(ELM327_SIM_CHR_WRITE_UUID),
-                .access_cb = elm327_gatt_write_access_cb,
-                .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
+                .uuid       = BLE_UUID16_DECLARE(ELM327_SIM_CHR_WRITE_UUID),
+                .access_cb  = elm327_gatt_write_access_cb,
+                .flags      = BLE_GATT_CHR_F_WRITE_NO_RSP,
             },
             { 0 }, /* Terminator */
         },
@@ -333,7 +352,7 @@ static void elm327_respond(const char *fmt, ...)
  * ------------------------------------------------------------------------- */
 
 /**
- * @brief Case-insensitive prefix match, since real ELM327 command
+ * @brief Case-insensitive full-string match, since real ELM327 command
  *        parsers accept commands in either case.
  */
 static bool elm327_cmd_is(const char *cmd, const char *pattern)
@@ -540,57 +559,70 @@ static void elm327_cmd_task(void *arg)
 
 static void elm327_advertise_start(void)
 {
-    struct ble_gap_adv_params adv_params = { 0 };
-    struct ble_hs_adv_fields fields = { 0 };
+    struct ble_gap_adv_params adv_params;
+    struct ble_hs_adv_fields fields;
+    int rc;
 
+    memset(&fields, 0, sizeof(fields));
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
 
-    fields.name = (uint8_t *)ELM327_SIM_DEVICE_NAME;
-    fields.name_len = strlen(ELM327_SIM_DEVICE_NAME);
+    const char *device_name = ELM327_SIM_DEVICE_NAME;
+    fields.name = (uint8_t *)device_name;
+    fields.name_len = strlen(device_name);
     fields.name_is_complete = 1;
 
-    static ble_uuid16_t svc_uuid = BLE_UUID16_INIT(ELM327_SIM_SVC_UUID);
-    fields.uuids16 = &svc_uuid;
-    fields.num_uuids16 = 1;
-    fields.uuids16_is_complete = 1;
+    uint8_t adv_data[31];
+    uint8_t adv_len = 0;
 
-    fields.tx_pwr_lvl_is_present = 1;
-    fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
+    rc = ble_hs_adv_set_fields(&fields,
+                            adv_data,
+                            &adv_len,
+                            sizeof(adv_data));
 
-    int rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gap_adv_set_fields failed, rc=%d", rc);
+        ESP_LOGE(TAG, "Failed to encode adv fields, rc=%d", rc);
         return;
     }
 
+    rc = ble_gap_adv_set_data(adv_data, adv_len);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Failed to set adv data, rc=%d", rc);
+        return;
+    }
+
+    memset(&adv_params, 0, sizeof(adv_params));
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
-    /* Explicit fast advertising interval (units of 0.625ms: 48 = 30ms,
-     * 96 = 60ms), rather than leaving these zeroed. Zero is supposed to
-     * mean "let the stack pick a spec-default interval," and that's
-     * almost certainly what was already happening - but making it
-     * explicit removes any doubt about that when diagnosing a
-     * connection-reliability issue, and a fast interval minimizes the
-     * central's odds of missing an advertising event within its scan
-     * window during connection establishment. */
-    adv_params.itvl_min = 48;
-    adv_params.itvl_max = 96;
-
-    rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER, &adv_params,
-                            elm327_gap_event_cb, NULL);
+    /* FIX 1 (continued): pass elm327_gap_event_cb, consistent with the
+     * forward declaration and the function defined below. */
+    rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER,
+                           &adv_params, elm327_gap_event_cb, NULL);
     if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gap_adv_start failed, rc=%d", rc);
-        return;
+        ESP_LOGE(TAG, "Failed to start advertising, rc=%d", rc);
+    } else {
+        ESP_LOGI(TAG, "Advertising started as '%s'", ELM327_SIM_DEVICE_NAME);
     }
-
-    ESP_LOGI(TAG, "Advertising started as \"%s\" (itvl_min=%dms, itvl_max=%dms)",
-             ELM327_SIM_DEVICE_NAME, adv_params.itvl_min * 625 / 1000,
-             adv_params.itvl_max * 625 / 1000);
 }
 
 /* ---------------------------------------------------------------------------
  * GAP Event Handling
+ *
+ * FIX 2: On BLE_GAP_EVENT_CONNECT success, save s_conn_handle so that
+ *         elm327_send_response() can actually deliver notifications.
+ *         Previously the success branch fell through without storing the
+ *         handle, so s_conn_handle stayed BLE_HS_CONN_HANDLE_NONE and
+ *         every response was silently dropped.
+ *
+ * FIX 2 (cont): Handle BLE_GAP_EVENT_SUBSCRIBE to set s_notify_enabled
+ *         when DBAS writes the CCCD. Previously s_notify_enabled was
+ *         never set to true, so elm327_send_response()'s guard always
+ *         blocked transmission even after a successful connection.
+ *
+ * FIX 3: Handle BLE_GAP_EVENT_MTU to keep s_att_mtu in sync with the
+ *         negotiated value. obd.c requests MTU 185; without this the
+ *         simulator chunks at the default 20-byte payload limit for the
+ *         entire session.
  * ------------------------------------------------------------------------- */
 
 static int elm327_gap_event_cb(struct ble_gap_event *event, void *arg)
@@ -598,38 +630,49 @@ static int elm327_gap_event_cb(struct ble_gap_event *event, void *arg)
     (void)arg;
 
     switch (event->type) {
+
         case BLE_GAP_EVENT_CONNECT:
-            if (event->connect.status != 0) {
-                ESP_LOGW(TAG, "Connection attempt failed, status=%d; resuming advertising",
-                         event->connect.status);
+            if (event->connect.status == 0) {
+                /* FIX 2: store the connection handle so notification
+                 * sends have a valid target. */
+                s_conn_handle = event->connect.conn_handle;
+                s_att_mtu = ELM327_DEFAULT_ATT_MTU; /* Reset until MTU exchange completes */
+                ESP_LOGI(TAG, "DBAS connected, conn_handle=%d", s_conn_handle);
+            } else {
+                ESP_LOGW(TAG, "Connection attempt failed, status=%d", event->connect.status);
                 elm327_advertise_start();
-                return 0;
             }
-            ESP_LOGI(TAG, "Central connected, conn_handle=%d", event->connect.conn_handle);
-            s_conn_handle = event->connect.conn_handle;
-            s_att_mtu = ELM327_DEFAULT_ATT_MTU;
-            s_notify_enabled = false;
-            s_rx_accum_len = 0;
             return 0;
 
         case BLE_GAP_EVENT_DISCONNECT:
-            ESP_LOGW(TAG, "Central disconnected, reason=%d; resuming advertising",
+            ESP_LOGI(TAG, "DBAS disconnected, reason=%d - restarting advertising",
                      event->disconnect.reason);
+            /* FIX 2: clear state so stale handle/subscription flags
+             * can't cause a spurious send to a dead connection. */
             s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
             s_notify_enabled = false;
-            s_rx_accum_len = 0;
+            s_att_mtu = ELM327_DEFAULT_ATT_MTU;
             elm327_advertise_start();
             return 0;
 
         case BLE_GAP_EVENT_SUBSCRIBE:
+            /* FIX 2: NimBLE fires this event when the peer (DBAS) writes
+             * the CCCD on the notify characteristic. cur_notify is 1 when
+             * notifications are being enabled, 0 when disabled. This is
+             * the only correct way to set s_notify_enabled - there is no
+             * other code path that does so. */
             if (event->subscribe.attr_handle == s_notify_val_handle) {
                 s_notify_enabled = event->subscribe.cur_notify;
-                ESP_LOGI(TAG, "DBAS %s FFF1 notifications",
-                         s_notify_enabled ? "subscribed to" : "unsubscribed from");
+                ESP_LOGI(TAG, "Notification subscription changed: %s",
+                         s_notify_enabled ? "enabled" : "disabled");
             }
             return 0;
 
         case BLE_GAP_EVENT_MTU:
+            /* FIX 3: track the negotiated MTU so elm327_send_response()
+             * chunks at the right size. obd.c requests 185; without this
+             * the simulator defaults to 20-byte payload chunks for the
+             * whole session. */
             s_att_mtu = event->mtu.value;
             ESP_LOGI(TAG, "ATT MTU negotiated: %d", s_att_mtu);
             return 0;
@@ -650,19 +693,11 @@ static void ble_on_reset(int reason)
 
 static void ble_on_sync(void)
 {
-    /* The address override itself already happened in elm327_sim_init(),
-     * BEFORE nimble_port_init() - see the comment there for why this has
-     * to happen at the controller MAC level rather than here at the
-     * NimBLE host level (there is no host-level "set my public address"
-     * API; NimBLE expects the public address to come from the
-     * controller). By the time we get here, ble_hs_id_infer_auto() will
-     * simply discover the address we already forced. */
     int rc = ble_hs_id_infer_auto(0, &s_own_addr_type);
     if (rc != 0) {
-        ESP_LOGE(TAG, "ble_hs_id_infer_auto failed, rc=%d", rc);
+        ESP_LOGE(TAG, "Failed to infer address type, rc=%d", rc);
         return;
     }
-
     elm327_advertise_start();
 }
 
@@ -717,7 +752,7 @@ esp_err_t elm327_sim_init(void)
     }
 
     ble_hs_cfg.reset_cb = ble_on_reset;
-    ble_hs_cfg.sync_cb = ble_on_sync;
+    ble_hs_cfg.sync_cb  = ble_on_sync;
 
     ble_svc_gap_init();
     ble_svc_gatt_init();

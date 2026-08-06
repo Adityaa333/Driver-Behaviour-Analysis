@@ -14,6 +14,7 @@
 #include "crash_detection.h"
 #include "idling_detection.h"
 #include "geofence.h"
+#include "led_indicator.h"
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -106,7 +107,9 @@ static void task_manager_telemetry_task(void *arg)
                 cJSON_AddNumberToObject(root, "obd_speed_kmh", sample.obd_speed_kmh);
                 cJSON_AddBoolToObject(root, "throttle_position_valid", sample.throttle_position_valid);
                 cJSON_AddNumberToObject(root, "throttle_position_pct", sample.throttle_position_pct);
-
+                cJSON_AddBoolToObject(root, "coolant_temp_valid", sample.coolant_temp_valid);
+                cJSON_AddNumberToObject(root, "coolant_temp_c", sample.coolant_temp_c);
+ 
                 char *json_str = cJSON_PrintUnformatted(root);
                 if (json_str != NULL) {
                     esp_err_t err = mqtt_client_publish_telemetry(json_str);
@@ -225,11 +228,15 @@ void task_manager_start_all(void)
     if (init_with_retry(idling_detection_init, "idling_detection") != ESP_OK) {
         ESP_LOGE(TAG, "idling_detection failed to start; continuing without it");
     }
-
+ 
     if (init_with_retry(geofence_init, "geofence") != ESP_OK) {
         ESP_LOGE(TAG, "geofence failed to start; continuing without it");
     }
-
+ 
+    if (init_with_retry(led_indicator_init, "led_indicator") != ESP_OK) {
+        ESP_LOGE(TAG, "led_indicator failed to start; continuing without it");
+    }
+ 
     /* Telemetry/status publishing tasks. Priorities/stack sizes reuse
      * wifi_manager's constants from config.h: both tasks are low
      * frequency, non-time-critical background reporting work, the same

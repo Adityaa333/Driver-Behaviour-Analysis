@@ -16,7 +16,7 @@ export default function CrashPanel({ crashes, loading }) {
 
   return (
     <div
-      className={`glass-card rounded-2xl h-96 flex flex-col items-center justify-center gap-4 relative overflow-hidden ${
+      className={`glass-card rounded-2xl h-48 flex flex-col items-center justify-center gap-4 relative overflow-hidden ${
         isActive ? 'crash-flash border-[var(--color-danger)]/60' : ''
       }`}
     >
